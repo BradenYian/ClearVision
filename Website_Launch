@@ -1,0 +1,777 @@
+
+!pip -q install pyngrok > /dev/null
+!pip -q install streamlit > /dev/null
+!pip -q install patool > /dev/null
+
+
+import cv2
+import gdown
+import glob
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import patoolib
+import streamlit as st
+
+from joblib import dump
+from tqdm import tqdm
+from pyngrok import ngrok
+
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+
+from keras.applications.vgg16 import VGG16
+from keras.models import Sequential
+from keras.layers import Dense, Dropout, GlobalAveragePooling2D
+from keras.optimizers import SGD
+
+
+
+
+def launch_website():
+  print ("Click this link to try your web app:")
+  if (ngrok.get_tunnels() != None):
+    ngrok.kill()
+  tunnel = ngrok.connect()
+  print(tunnel.public_url)
+  !streamlit run --server.port 80 app.py > /dev/null
+!ngrok authtoken 30iO8wSjR6B6RzKjBmEu41rkG98_K1aCukdpugCxbTk1KB9R
+
+!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
+!gdown 1cHmPkUzkHOorE5RYXWhyyBcKdLUaNWk9
+!gdown 1MPct9YvPv-cerTT9K7Oy1UfkFCg2Xh5K
+!gdown 1qH3KajXHUYQUEuPFM8S8KaPFt1i20eVe
+!gdown 14hZ20O8eUeWQy5loYlfzbyp4YG_fm1sD
+
+!cd /content
+!mv reconstructor_R.keras reconstructor.keras
+!ls -lh reconstructor*.keras
+%%writefile app.py
+import streamlit as st
+import numpy as np
+import cv2
+import tensorflow as tf
+import os
+import json
+import zipfile
+import tempfile
+import io
+
+import keras
+from keras import layers
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+
+
+@keras.utils.register_keras_serializable(package="custom")
+class EffNetV2Preprocess(layers.Layer):
+    def call(self, inputs):
+        inputs = tf.cast(inputs, tf.float32)
+        return preprocess_input(inputs * 255.0)
+
+    def get_config(self):
+        return super().get_config()
+
+
+CLASSIFIER_PATH = "cifar10_clf.keras"
+
+DELTA_MODEL_PATH = "delta_student_adv_only.keras"
+DELTA_PATCHED_PATH = "delta_student_adv_only.nolambda.keras"
+
+RECONSTRUCTOR_PATH = "reconstructor.keras"
+ATTACK_TYPE_PATH   = "attack_type_from_delta.keras"
+
+
+NORM_CLASSIFIER_PATH = "norm_classifier_with_norm.keras"
+
+cifar10_class_names = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck"
+]
+
+ATTACK_LABELS = ["fgsm", "pgd"]
+
+st.set_page_config(layout="wide")
+st.title("CIFAR-10 Defense Pipeline: Clean → (Attacked) Detection → Isolation → Reconstruction → Norm-Gated Mix → Final Classification")
+
+st.sidebar.info("Delta is NOT rescaled by eps (matches training: delta_true = x_adv - x_clean).")
+
+with st.expander("Debug: files in current directory"):
+    st.write(os.listdir("."))
+
+
+def decode_image(uploaded_file):
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+def to_cifar(img_bgr):
+    img = cv2.resize(img_bgr, (32, 32), interpolation=cv2.INTER_AREA)
+    img = cv2.cvtColor(img_bgr if img_bgr.shape[:2] == (32, 32) else img, cv2.COLOR_BGR2RGB)
+    img = img.astype("float32") / 255.0
+    return np.expand_dims(img, axis=0), img
+
+def delta_heatmap(delta):
+    d = np.abs(delta)
+    d_gray = d.mean(axis=-1)
+    d_gray = d_gray / (d_gray.max() + 1e-8)
+    d8 = (d_gray * 255).astype(np.uint8)
+    hm = cv2.applyColorMap(d8, cv2.COLORMAP_MAGMA)
+    return cv2.cvtColor(hm, cv2.COLOR_BGR2RGB), float(d.mean()), float(d.max())
+
+def png_bytes_from_rgb(rgb_img_uint8):
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb_img_uint8, cv2.COLOR_RGB2BGR))
+    if not ok:
+        return None
+    return buf.tobytes()
+
+def png_bytes_from_float01(rgb_float01):
+    arr = np.clip(rgb_float01 * 255.0, 0, 255).astype(np.uint8)
+    return png_bytes_from_rgb(arr)
+
+def npy_download(data: np.ndarray):
+    buf = io.BytesIO()
+    np.save(buf, data.astype(np.float32))
+    return buf.getvalue()
+
+
+def patch_remove_final_lambda(src_path: str, dst_path: str):
+    """
+    Remove final Lambda layer (often references CFG.eps) from a Keras 3 .keras zip model,
+    and set output to the Lambda's input (the layer right before it).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with zipfile.ZipFile(src_path, "r") as z:
+            z.extractall(tmpdir)
+
+        config_path = os.path.join(tmpdir, "config.json")
+        if not os.path.exists(config_path):
+            raise RuntimeError("config.json not found inside .keras")
+
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+        model_cfg = cfg["config"]
+        layers_list = model_cfg["layers"]
+        output_layers = model_cfg.get("output_layers", [])
+        out_name = output_layers[0][0] if output_layers else None
+
+        lambda_idx = None
+        lambda_layer = None
+        for i, layer_cfg in enumerate(layers_list):
+            if layer_cfg.get("class_name") == "Lambda":
+                name = layer_cfg.get("config", {}).get("name", "")
+                if out_name is None or name == out_name or name == "delta_hat":
+                    lambda_idx = i
+                    lambda_layer = layer_cfg
+                    if name == out_name:
+                        break
+
+        if lambda_layer is None:
+            raise RuntimeError("Could not find the final Lambda layer to remove.")
+
+        inbound = lambda_layer.get("inbound_nodes", [])
+        prev_layer_name = None
+        if inbound and "args" in inbound[0] and inbound[0]["args"]:
+            first_arg = inbound[0]["args"][0]
+            if isinstance(first_arg, dict):
+                kh = first_arg.get("config", {}).get("keras_history", None)
+                if kh and len(kh) >= 1:
+                    prev_layer_name = kh[0]
+
+        if prev_layer_name is None:
+            prev_layer_name = "activation_21"
+
+        model_cfg["output_layers"] = [[prev_layer_name, 0, 0]]
+        layers_list.pop(lambda_idx)
+
+        with open(config_path, "w") as f:
+            json.dump(cfg, f)
+
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
+
+        with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, tmpdir)
+                    z.write(full, rel)
+
+@st.cache_resource
+def load_classifier():
+    return keras.models.load_model(CLASSIFIER_PATH, compile=False, safe_mode=False)
+
+@st.cache_resource
+def load_delta_base(src_path: str, patched_path: str):
+    keras.config.enable_unsafe_deserialization()
+    if not os.path.exists(patched_path):
+        patch_remove_final_lambda(src_path, patched_path)
+    return keras.models.load_model(patched_path, compile=False, safe_mode=False)
+
+@st.cache_resource
+def load_reconstructor():
+    return keras.models.load_model(RECONSTRUCTOR_PATH, compile=False, safe_mode=False)
+
+@st.cache_resource
+def load_attack_type_clf():
+    return keras.models.load_model(ATTACK_TYPE_PATH, compile=False, safe_mode=False)
+
+@st.cache_resource
+def load_norm_clf():
+    return keras.models.load_model(NORM_CLASSIFIER_PATH, compile=False, safe_mode=False)
+
+clf = None
+try:
+    clf = load_classifier()
+except Exception as e:
+    st.error(f"Classifier load failed: {type(e).__name__}: {e}")
+
+D_adv = None
+if os.path.exists(DELTA_MODEL_PATH):
+    try:
+        D_adv = load_delta_base(DELTA_MODEL_PATH, DELTA_PATCHED_PATH)
+        st.sidebar.success(f"Delta model loaded (patched): {DELTA_PATCHED_PATH}")
+    except Exception as e:
+        st.sidebar.error("Delta model failed to load.")
+        st.error(f"Delta model load failed: {type(e).__name__}: {e}")
+else:
+    st.sidebar.warning(f"Missing: {DELTA_MODEL_PATH}")
+
+R = None
+if os.path.exists(RECONSTRUCTOR_PATH):
+    try:
+        R = load_reconstructor()
+        st.sidebar.success(f"Reconstructor loaded: {RECONSTRUCTOR_PATH}")
+    except Exception as e:
+        st.sidebar.error("Reconstructor failed to load.")
+        st.error(f"Reconstructor load failed: {type(e).__name__}: {e}")
+else:
+    st.sidebar.warning(f"Missing: {RECONSTRUCTOR_PATH}")
+
+attack_type_clf = None
+if os.path.exists(ATTACK_TYPE_PATH):
+    try:
+        attack_type_clf = load_attack_type_clf()
+        st.sidebar.success(f"Attack-type model loaded: {ATTACK_TYPE_PATH}")
+    except Exception as e:
+        st.sidebar.error("Attack-type model failed to load.")
+        st.error(f"Attack-type load failed: {type(e).__name__}: {e}")
+else:
+    st.sidebar.warning(f"Missing: {ATTACK_TYPE_PATH}")
+
+norm_clf = None
+if os.path.exists(NORM_CLASSIFIER_PATH):
+    try:
+        norm_clf = load_norm_clf()
+        st.sidebar.success(f"Norm classifier loaded: {NORM_CLASSIFIER_PATH}")
+    except Exception as e:
+        st.sidebar.error("Norm classifier failed to load.")
+        st.error(f"Norm classifier load failed: {type(e).__name__}: {e}")
+else:
+    st.sidebar.warning(f"Missing: {NORM_CLASSIFIER_PATH}")
+
+def ss_init(name, value):
+    if name not in st.session_state:
+        st.session_state[name] = value
+
+ss_init("x_clean", None)
+ss_init("img32_clean", None)
+
+ss_init("x_adv", None)
+ss_init("img32_adv", None)
+ss_init("delta", None)
+ss_init("delta_hm", None)
+ss_init("x_rec", None)
+ss_init("x_mix", None)
+ss_init("x_final", None)
+ss_init("attack_type", None)
+ss_init("norm_label", None)
+ss_init("norm_probs2", None)
+ss_init("final_mode", None)
+ss_init("final_pred", None)
+ss_init("final_top3", None)
+
+def compute_attack_type_from_delta(delta: np.ndarray):
+    if attack_type_clf is None:
+        return None
+
+    inp = np.expand_dims(delta.astype(np.float32), axis=0)
+
+    try:
+        expected = attack_type_clf.inputs[0].shape
+        if len(expected) == 4 and expected[-1] == 1 and inp.shape[-1] == 3:
+            inp = np.mean(inp, axis=-1, keepdims=True).astype(np.float32)
+    except Exception:
+        pass
+
+    logits = attack_type_clf.predict(inp, verbose=0)[0]
+    logits = np.array(logits).reshape(-1)
+
+    if logits.shape[0] == 2:
+        probs = tf.nn.softmax(logits).numpy()
+    elif logits.shape[0] == 1:
+        p_pgd = float(logits[0])
+        probs = np.array([1.0 - p_pgd, p_pgd], dtype=np.float32)
+    else:
+        probs = logits
+
+    pred_idx = int(np.argmax(probs))
+    pred_label = ATTACK_LABELS[pred_idx] if pred_idx < len(ATTACK_LABELS) else f"class_{pred_idx}"
+    return pred_label, probs
+
+def compute_norm_from_attacked(x_adv: np.ndarray):
+    """
+    Returns:
+      norm_label in {"Linf","L2"} (forced), norm_probs2 = [p(Linf), p(L2)]
+    """
+    if norm_clf is None:
+        return None, None
+
+    nlogits = norm_clf.predict(x_adv.astype(np.float32), verbose=0)[0]
+    nlogits = np.array(nlogits).reshape(-1)
+
+    norm_probs2 = None
+    if nlogits.shape[0] == 3:
+        p3 = tf.nn.softmax(nlogits).numpy()
+        p_linf = float(p3[0] + p3[2])
+        p_l2   = float(p3[1])
+        norm_probs2 = np.array([p_linf, p_l2], dtype=np.float32)
+    elif nlogits.shape[0] == 2:
+        p2 = tf.nn.softmax(nlogits).numpy()
+        norm_probs2 = p2.astype(np.float32)
+    elif nlogits.shape[0] == 1:
+        p_l2 = float(nlogits[0])
+        norm_probs2 = np.array([1.0 - p_l2, p_l2], dtype=np.float32)
+
+    if norm_probs2 is None:
+        return None, None
+
+    norm_label = "L2" if int(np.argmax(norm_probs2)) == 1 else "Linf"
+    return norm_label, norm_probs2
+
+def compute_reconstruction(x_adv: np.ndarray, delta: np.ndarray):
+    if R is None:
+        return None
+    delta_b = np.expand_dims(delta.astype(np.float32), axis=0)
+    x_rec = R.predict([x_adv.astype(np.float32), delta_b], verbose=0)[0]
+    return np.clip(x_rec, 0.0, 1.0).astype(np.float32)
+
+def compute_mix_if_needed(x_adv: np.ndarray, x_rec: np.ndarray, norm_label: str, mix_alpha: float):
+    """
+    Only mix if norm_label == "L2" (per your requirement).
+    """
+    if norm_label != "L2":
+        return None, x_rec, "NOT MIXED (norm=Linf → final is reconstructed)"
+    a = float(mix_alpha)
+    x_mix = np.clip(a * x_adv[0] + (1.0 - a) * x_rec, 0.0, 1.0).astype(np.float32)
+    return x_mix, x_mix, f"MIXED (norm=L2 → final is x_mix = {a:.2f}*x_adv + {1-a:.2f}*x_rec)"
+
+FORCED_IDX = 0
+
+def classify_with_base(x_img32: np.ndarray):
+    if clf is None:
+        return None, None, None
+
+    x = np.expand_dims(x_img32, axis=0).astype(np.float32)
+
+    preds = clf.predict(x, verbose=0)[0]
+    probs = preds / np.sum(preds)
+
+    top_indices = np.argsort(probs)[::-1][:3]
+
+    pred = (cifar10_class_names[top_indices[0]], float(probs[top_indices[0]]))
+    top3 = [(cifar10_class_names[i], float(probs[i])) for i in top_indices]
+
+    return pred, top3, probs
+
+
+
+
+
+mix_alpha = st.sidebar.slider(
+    "Mix alpha (only used if norm == L2)",
+    0.0, 1.0, 0.5, 0.05
+)
+st.sidebar.caption("If the norm is predicted as **L2**, the app will create **x_mix** and use it for the final prediction.")
+
+
+page = st.sidebar.radio(
+    "Pages",
+    [
+        "0) Clean (Defenseless) Baseline",
+        "1) Upload & Attack Detection",
+        "2) Norm Classification (L∞ vs L2)",
+        "3) Defense Outputs (Reconstruct + Mix)",
+        "4) Final Classification (Summary + Downloads)"
+    ]
+)
+
+
+if page == "0) Clean (Defenseless) Baseline":
+    st.header("0) Clean (Defenseless) Baseline")
+
+    st.write(
+        "Upload a **CLEAN** image (non-attacked). This is the **defenseless baseline**.\n"
+        "It runs the **base classifier** directly on the clean input so you can compare against the attacked image later."
+    )
+
+    up_clean = st.file_uploader("Upload CLEAN image", type=["png", "jpg", "jpeg"], key="clean_upload_page0")
+    if up_clean:
+        img_bgr = decode_image(up_clean)
+        if img_bgr is None:
+            st.error("Could not decode image.")
+            st.stop()
+
+        st.image(img_bgr, caption="Uploaded clean image (BGR)", channels="BGR")
+
+        x_clean, img32_clean = to_cifar(img_bgr)
+        st.session_state.x_clean = x_clean
+        st.session_state.img32_clean = img32_clean
+
+        st.subheader("Base classifier on clean image (x_clean)")
+        if clf is None:
+            st.info("Base classifier not available.")
+        else:
+            pred_clean, top3_clean, _ = classify_with_base(img32_clean)
+            if pred_clean is None:
+                st.warning("Base classifier prediction failed.")
+            else:
+                st.write(f"**Prediction on clean:** {pred_clean[0]} ({pred_clean[1]:.2f})")
+                st.write("**Top 3:**")
+                for label, p in top3_clean:
+                    st.write(f"- {label}: {p:.2f}")
+
+        st.subheader("Download")
+        st.download_button(
+            "Download clean 32×32 image (PNG)",
+            data=png_bytes_from_float01(img32_clean),
+            file_name="clean_32x32.png",
+            mime="image/png"
+        )
+
+
+elif page == "1) Upload & Attack Detection":
+    st.header("1) Upload & Attack Detection")
+    st.write(
+        "Upload the **ATTACKED** image once. The app will automatically:\n"
+        "- Convert to 32×32 CIFAR-10 format\n"
+        "- Predict **δ̂** (attack delta)\n"
+        "- Show a heatmap of |δ̂|\n"
+        "- Predict **attack type** (FGSM vs PGD) from δ̂\n"
+        "- Run the **base classifier** on the attacked image (x_adv)\n"
+        "\nIf you uploaded a clean image on Page 0, you can compare the baseline vs attacked predictions."
+    )
+
+    if D_adv is None:
+        st.warning("Delta isolator model not loaded. Put the file next to app.py and refresh.")
+        st.stop()
+
+    up_adv = st.file_uploader("Upload ATTACKED image", type=["png", "jpg", "jpeg"], key="adv_upload_page1")
+    if up_adv:
+        img_bgr = decode_image(up_adv)
+        if img_bgr is None:
+            st.error("Could not decode image.")
+            st.stop()
+
+        st.image(img_bgr, caption="Uploaded attacked image (BGR)", channels="BGR")
+
+        x_adv, img32 = to_cifar(img_bgr)
+        delta = D_adv.predict(x_adv, verbose=0)[0]
+        hm, d_mean, d_max = delta_heatmap(delta)
+
+        st.session_state.x_adv = x_adv
+        st.session_state.img32_adv = img32
+        st.session_state.delta = delta
+        st.session_state.delta_hm = hm
+
+        at = compute_attack_type_from_delta(delta)
+        if at is not None:
+            pred_label, probs = at
+            st.session_state.attack_type = pred_label
+        else:
+            st.session_state.attack_type = None
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.image(img32, caption="Attacked (32×32 RGB)", channels="RGB")
+        with c2:
+            st.image(hm, caption="|δ̂| heatmap", channels="RGB")
+
+        st.caption(
+            f"δ̂ stats: min={float(delta.min()):.4f}, max={float(delta.max()):.4f}, "
+            f"max|δ̂|={float(np.max(np.abs(delta))):.4f}, mean|δ̂|={float(np.mean(np.abs(delta))):.5f}"
+        )
+
+        st.subheader("Base classifier comparison (clean vs attacked)")
+        if clf is None:
+            st.info("Base classifier not available.")
+        else:
+            if st.session_state.img32_clean is not None:
+                pred_clean, top3_clean, _ = classify_with_base(st.session_state.img32_clean)
+                if pred_clean is not None:
+                    st.write(f"**Clean prediction:** {pred_clean[0]} ({pred_clean[1]:.2f})")
+            else:
+                st.caption("Tip: upload a clean baseline image on **Page 0** to compare.")
+
+            pred_adv, top3_adv, _ = classify_with_base(img32)
+            if pred_adv is not None:
+                st.write(f"**Attacked prediction:** {pred_adv[0]} ({pred_adv[1]:.2f})")
+
+        st.subheader("Attack Type (from δ̂)")
+        if st.session_state.attack_type is not None:
+            st.write(f"**Predicted attack:** `{st.session_state.attack_type}`")
+        else:
+            st.info("Attack-type classifier not available.")
+
+        st.subheader("Downloads")
+        hm_png = png_bytes_from_rgb(hm.astype(np.uint8))
+        if hm_png:
+            st.download_button(
+                "Download delta heatmap (PNG)",
+                data=hm_png,
+                file_name="delta_heatmap.png",
+                mime="image/png"
+            )
+        st.download_button(
+            "Download delta array (.npy)",
+            data=npy_download(delta),
+            file_name="delta.npy",
+            mime="application/octet-stream"
+        )
+
+
+elif page == "2) Norm Classification (L∞ vs L2)":
+    st.header("2) Norm Classification (L∞ vs L2)")
+
+    st.write(
+        "This step uses the **attacked image you uploaded** (not δ̂) to classify the attack norm.\n\n"
+        "**Important rule:**\n"
+        "- If norm is **L2** → we will use the **MIX defense** in the final step.\n"
+        "- If norm is **L∞** → we will **NOT** mix; we use the reconstructed image directly.\n"
+    )
+
+    if st.session_state.x_adv is None:
+        st.info("Upload an attacked image on **Page 1** first.")
+        st.stop()
+
+    x_adv = st.session_state.x_adv
+    norm_label, norm_probs2 = compute_norm_from_attacked(x_adv)
+
+    st.session_state.norm_label = norm_label
+    st.session_state.norm_probs2 = norm_probs2
+
+    if norm_label is None or norm_probs2 is None:
+        st.warning("Norm classifier not available or output could not be interpreted.")
+        st.stop()
+
+    st.subheader("Result")
+    st.write(f"**Predicted norm:** `{norm_label}` (forced to only `Linf` or `L2`)")
+    st.write(f"- Linf: {float(norm_probs2[0]):.3f}")
+    st.write(f"- L2  : {float(norm_probs2[1]):.3f}")
+
+    if norm_label == "L2":
+        st.success("Norm is L2 → the app will create a MIXED image later and use it for final classification.")
+    else:
+        st.info("Norm is Linf → the app will NOT mix; final classification will use the reconstructed image.")
+
+
+elif page == "3) Defense Outputs (Reconstruct + Mix)":
+    st.header("3) Defense Outputs")
+
+    st.write(
+        "This page builds the defense outputs automatically:\n"
+        "- **Reconstructed image (R)** from attacked image + predicted δ̂\n"
+        "- **Mixed image (x_mix)** only if predicted norm is **L2**\n\n"
+        "**Mix rule (only for L2):** `x_mix = alpha*x_adv + (1-alpha)*x_rec`"
+    )
+
+    if st.session_state.x_adv is None or st.session_state.delta is None:
+        st.info("Upload an attacked image on **Page 1** first.")
+        st.stop()
+    if R is None:
+        st.warning("Reconstructor not loaded.")
+        st.stop()
+
+    x_adv = st.session_state.x_adv
+    delta = st.session_state.delta
+
+    x_rec = compute_reconstruction(x_adv, delta)
+    if x_rec is None:
+        st.error("Could not compute reconstruction.")
+        st.stop()
+    st.session_state.x_rec = x_rec
+
+    if st.session_state.norm_label is None or st.session_state.norm_probs2 is None:
+        nl, np2 = compute_norm_from_attacked(x_adv)
+        st.session_state.norm_label = nl
+        st.session_state.norm_probs2 = np2
+
+    norm_label = st.session_state.norm_label
+    if norm_label is None:
+        st.warning("Norm label unavailable; cannot decide whether to mix.")
+        st.stop()
+
+    x_mix, x_final, final_mode = compute_mix_if_needed(x_adv, x_rec, norm_label, mix_alpha)
+    st.session_state.x_mix = x_mix
+    st.session_state.x_final = x_final
+    st.session_state.final_mode = final_mode
+
+    cols = st.columns(3 if x_mix is None else 4)
+    with cols[0]:
+        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
+    with cols[1]:
+        st.image(st.session_state.delta_hm, caption="|δ̂| heatmap", channels="RGB")
+    with cols[2]:
+        st.image(x_rec, caption="Reconstructed (x_rec)", channels="RGB")
+    if x_mix is not None:
+        with cols[3]:
+            st.image(x_mix, caption="Mixed (x_mix) — ONLY for L2", channels="RGB")
+
+    st.subheader("What will be used next?")
+    st.write(f"**Final input selection:** {final_mode}")
+
+    st.subheader("Downloads")
+    st.download_button(
+        "Download reconstructed image (PNG)",
+        data=png_bytes_from_float01(x_rec),
+        file_name="reconstructed.png",
+        mime="image/png"
+    )
+    st.download_button(
+        "Download reconstructed array (.npy)",
+        data=npy_download(x_rec),
+        file_name="reconstructed.npy",
+        mime="application/octet-stream"
+    )
+
+    if x_mix is not None:
+        st.download_button(
+            "Download mixed image (PNG)",
+            data=png_bytes_from_float01(x_mix),
+            file_name="mixed.png",
+            mime="image/png"
+        )
+        st.download_button(
+            "Download mixed array (.npy)",
+            data=npy_download(x_mix),
+            file_name="mixed.npy",
+            mime="application/octet-stream"
+        )
+
+
+elif page == "4) Final Classification (Summary + Downloads)":
+    st.header("4) Final Classification")
+
+    st.write(
+        "This page shows the **final** classification result and a clean summary of what happened.\n\n"
+        "**Decision logic:**\n"
+        "- If norm is **L2** → final image is **MIXED** (`x_mix`) and is classified.\n"
+        "- If norm is **L∞** → final image is **NOT MIXED** (use `x_rec`) and is classified.\n\n"
+    )
+
+    if st.session_state.x_adv is None or st.session_state.delta is None:
+        st.info("Upload an attacked image on **Page 1** first.")
+        st.stop()
+
+    if st.session_state.x_rec is None or st.session_state.x_final is None:
+        if R is None:
+            st.warning("Reconstructor not loaded; cannot compute final defense output.")
+            st.stop()
+
+        x_adv = st.session_state.x_adv
+        delta = st.session_state.delta
+        x_rec = compute_reconstruction(x_adv, delta)
+        st.session_state.x_rec = x_rec
+
+        if st.session_state.norm_label is None:
+            nl, np2 = compute_norm_from_attacked(x_adv)
+            st.session_state.norm_label = nl
+            st.session_state.norm_probs2 = np2
+
+        norm_label = st.session_state.norm_label
+        x_mix, x_final, final_mode = compute_mix_if_needed(x_adv, x_rec, norm_label, mix_alpha)
+        st.session_state.x_mix = x_mix
+        st.session_state.x_final = x_final
+        st.session_state.final_mode = final_mode
+
+    norm_label = st.session_state.norm_label
+    final_mode = st.session_state.final_mode or "Unknown"
+
+    if clf is not None:
+        pred, top3, _ = classify_with_base(st.session_state.x_final)
+    else:
+        pred, top3 = None, None
+    st.session_state.final_pred = pred
+    st.session_state.final_top3 = top3
+
+    st.subheader("Final result (automatic)")
+    st.write(f"**Norm:** `{norm_label}`")
+    st.write(f"**Final mode:** {final_mode}")
+    st.write(f"**Final prediction:** {pred[0]} ({pred[1]:.2f})")
+
+    st.write("**Top 3:**")
+    for label, p in top3:
+        st.write(f"- {label}: {p:.2f}")
+
+    st.divider()
+
+    st.subheader("Artifacts (for transparency / debugging)")
+
+    show_cols = st.columns(4 if st.session_state.x_mix is not None else 3)
+    with show_cols[0]:
+        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
+    with show_cols[1]:
+        st.image(st.session_state.x_rec, caption="Reconstructed (x_rec)", channels="RGB")
+    with show_cols[2]:
+        st.image(st.session_state.x_final, caption="Final input used (classified)", channels="RGB")
+    if st.session_state.x_mix is not None:
+        with show_cols[3]:
+            st.image(st.session_state.x_mix, caption="Mixed (x_mix) — only for L2", channels="RGB")
+
+    st.caption("Note: the mixed image only exists (and is used) when the predicted norm is L2.")
+
+    st.subheader("Downloads")
+    st.download_button(
+        "Download final image used for classification (PNG)",
+        data=png_bytes_from_float01(st.session_state.x_final),
+        file_name="final_used_for_classification.png",
+        mime="image/png"
+    )
+    st.download_button(
+        "Download final array used for classification (.npy)",
+        data=npy_download(np.asarray(st.session_state.x_final, dtype=np.float32)),
+        file_name="final_used_for_classification.npy",
+        mime="application/octet-stream"
+    )
+
+    if st.session_state.delta_hm is not None:
+        st.download_button(
+            "Download delta heatmap (PNG)",
+            data=png_bytes_from_rgb(st.session_state.delta_hm.astype(np.uint8)),
+            file_name="delta_heatmap.png",
+            mime="image/png"
+        )
+    if st.session_state.delta is not None:
+        st.download_button(
+            "Download delta array (.npy)",
+            data=npy_download(st.session_state.delta),
+            file_name="delta.npy",
+            mime="application/octet-stream"
+        )
+
+    st.subheader("Summary (automatic)")
+    if st.session_state.attack_type is not None:
+        st.write(f"- Attack type (from δ̂): `{st.session_state.attack_type}`")
+    else:
+        st.write("- Attack type (from δ̂): unavailable")
+
+    if st.session_state.norm_probs2 is not None:
+        st.write(
+            f"- Norm probs (forced Linf vs L2): Linf={float(st.session_state.norm_probs2[0]):.3f}, "
+            f"L2={float(st.session_state.norm_probs2[1]):.3f}"
+        )
+    else:
+        st.write("- Norm probs: unavailable")
+
+launch_website()
