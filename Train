@@ -1,0 +1,584 @@
+!pip -q install tqdm
+
+import os, random, math
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+
+print("TF:", tf.__version__)
+print("GPU:", tf.config.list_physical_devices("GPU"))
+# =========================
+# CELL 1 — Setup / Config
+# =========================
+import os, random
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+SEED = 1337
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+class CFG:
+    img_h, img_w, img_c = 32, 32, 3
+    num_classes = 10
+
+    train_size = 40000
+    val_size   = 5000
+    test_size  = 5000
+
+    batch_size = 128
+    clf_epochs = 10
+
+    # ONE eps for everything (model "knows" the strength)
+    eps = 0.1
+    fgsm_eps = eps
+    pgd_eps  = eps
+
+    pgd_steps = 10
+    pgd_alpha = 2/255.0
+
+    # paired delta model (teacher)
+    delta_epochs = 2
+    lr_delta = 2e-4
+
+    # adv-only student (defense attempt)
+    student_epochs = 2
+    lr_student = 2e-4
+
+    out_dir = "attack_delta_outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    clf_path     = os.path.join(out_dir, "cifar10_clf.keras")
+    delta_path   = os.path.join(out_dir, "delta_predictor_teacher.keras")     # teacher (paired)
+    student_path = os.path.join(out_dir, "delta_student_adv_only.keras")      # student (adv-only)
+CFG.cw_steps = 10
+CFG.cw_alpha = 0.02
+CFG.cw_eps_l2 = 1.5
+CFG.cw_eps_linf = CFG.eps   # optional; set None if you want pure L2
+
+print("Config ready.")
+# =========================
+# CELL 2 — Data
+# =========================
+def load_cifar10_subset():
+    (x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+    x_train = x_train.astype("float32") / 255.0
+    x_test  = x_test.astype("float32") / 255.0
+    y_train = y_train.squeeze().astype("int32")
+    y_test  = y_test.squeeze().astype("int32")
+
+    idx = np.random.permutation(len(x_train))
+    x_train, y_train = x_train[idx], y_train[idx]
+
+    x_tr = x_train[:CFG.train_size]
+    y_tr = y_train[:CFG.train_size]
+    x_va = x_train[CFG.train_size:CFG.train_size + CFG.val_size]
+    y_va = y_train[CFG.train_size:CFG.train_size + CFG.val_size]
+    x_te = x_test[:CFG.test_size]
+    y_te = y_test[:CFG.test_size]
+    return (x_tr, y_tr), (x_va, y_va), (x_te, y_te)
+
+(x_tr, y_tr), (x_va, y_va), (x_te, y_te) = load_cifar10_subset()
+print(x_tr.shape, x_va.shape, x_te.shape)
+
+train_ds = tf.data.Dataset.from_tensor_slices((x_tr, y_tr)).shuffle(10000, seed=SEED).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
+val_ds   = tf.data.Dataset.from_tensor_slices((x_va, y_va)).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
+test_ds  = tf.data.Dataset.from_tensor_slices((x_te, y_te)).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
+
+!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+
+# =========================
+# Custom layer (needed for classifier)
+# =========================
+@keras.utils.register_keras_serializable(package="custom")
+class EffNetV2Preprocess(layers.Layer):
+    def call(self, inputs):
+        inputs = tf.cast(inputs, tf.float32)
+        return preprocess_input(inputs * 255.0)
+
+    def get_config(self):
+        return super().get_config()
+!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
+loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
+
+@tf.function
+def fgsm_attack(model, x, y, eps):
+    with tf.GradientTape() as tape:
+        tape.watch(x)
+        logits = model(x, training=False)
+        loss = tf.reduce_mean(loss_fn(y, logits))
+    grad = tape.gradient(loss, x)
+    x_adv = x + eps * tf.sign(grad)
+    return tf.clip_by_value(x_adv, 0.0, 1.0)
+
+@tf.function
+def pgd_attack(model, x, y, eps, steps, alpha):
+    x_adv = x + tf.random.uniform(tf.shape(x), -eps, eps)
+    x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+
+    for _ in tf.range(tf.cast(steps, tf.int32)):
+        with tf.GradientTape() as tape:
+            tape.watch(x_adv)
+            logits = model(x_adv, training=False)
+            loss = tf.reduce_mean(loss_fn(y, logits))
+        grad = tape.gradient(loss, x_adv)
+        x_adv = x_adv + alpha * tf.sign(grad)
+        x_adv = tf.clip_by_value(x_adv, x - eps, x + eps)
+        x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+    return x_adv
+
+def make_adv_batch(x, y, attack_name):
+    eps = tf.constant(CFG.eps, tf.float32)
+
+    if attack_name == "fgsm":
+        return fgsm_attack(attack_clf, x, y, eps)
+
+    elif attack_name == "pgd":
+        return pgd_attack(
+            attack_clf, x, y,
+            eps,
+            tf.constant(CFG.pgd_steps, tf.int32),
+            tf.constant(CFG.pgd_alpha, tf.float32),
+        )
+
+    else:
+        raise ValueError("attack_name must be 'fgsm' or 'pgd'")
+# =========================
+# CELL 5 — Teacher delta model (paired): D([x_clean, x_adv]) -> delta in [-eps, eps]
+# =========================
+def conv_block(x, f):
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def build_delta_teacher():
+    x_clean_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_clean")
+    x_adv_in   = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
+
+    # observed delta feature (not cheating since both are inputs)
+    delta_feat = layers.Subtract()([x_adv_in, x_clean_in])
+    inp = layers.Concatenate()([x_clean_in, x_adv_in, delta_feat])
+
+    c1 = conv_block(inp, 64);  p1 = layers.MaxPool2D()(c1)
+    c2 = conv_block(p1, 128);  p2 = layers.MaxPool2D()(c2)
+    b  = conv_block(p2, 256)
+
+    u2 = layers.UpSampling2D()(b);  u2 = layers.Concatenate()([u2, c2])
+    c3 = conv_block(u2, 128)
+
+    u1 = layers.UpSampling2D()(c3); u1 = layers.Concatenate()([u1, c1])
+    c4 = conv_block(u1, 64)
+
+    out = layers.Conv2D(3, 1, padding="same")(c4)
+    out = layers.Activation("tanh")(out)
+    out = layers.Lambda(lambda t: t * CFG.eps, name="delta_hat")(out)
+    return keras.Model([x_clean_in, x_adv_in], out, name="delta_teacher_paired")
+
+D = build_delta_teacher()
+optD = keras.optimizers.Adam(CFG.lr_delta)
+D.summary()
+# =========================
+# CELL 6 — Teacher training (paired) — ALWAYS RETRAIN (no load_model)
+# FGSM + PGD ONLY (removed C&W)
+# =========================
+import os
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+
+# --- losses ---
+def teacher_losses(x_clean, x_adv, delta_hat):
+    delta_true = x_adv - x_clean
+
+    loss_delta = tf.reduce_mean(tf.square(delta_true - delta_hat))
+
+    x_adv_hat = tf.clip_by_value(x_clean + delta_hat, 0.0, 1.0)
+    loss_adv  = tf.reduce_mean(tf.square(x_adv - x_adv_hat))
+
+    loss_l1 = tf.reduce_mean(tf.abs(delta_hat))
+    total = loss_delta + 0.5 * loss_adv + 0.001 * loss_l1
+    return total, loss_delta, loss_adv, loss_l1, delta_true, x_adv_hat
+
+# --- train step ---
+# (still NO @tf.function; fine for FGSM/PGD and keeps debugging easy)
+def train_step_teacher(x_clean, y):
+    bs = tf.shape(x_clean)[0]
+
+    # split batch into 2 parts: FGSM / PGD
+    half = bs // 2
+
+    x1, y1 = x_clean[:half], y[:half]
+    x2, y2 = x_clean[half:], y[half:]
+
+    x_adv1 = make_adv_batch(x1, y1, "fgsm")
+    x_adv2 = make_adv_batch(x2, y2, "pgd")
+
+    x_adv = tf.concat([x_adv1, x_adv2], axis=0)
+
+    with tf.GradientTape() as tape:
+        delta_hat = D([x_clean, x_adv], training=True)
+        total, l_delta, l_adv, l1, _, _ = teacher_losses(x_clean, x_adv, delta_hat)
+
+    grads = tape.gradient(total, D.trainable_variables)
+    optD.apply_gradients(zip(grads, D.trainable_variables))
+    return total, l_delta, l_adv, l1
+
+# --- eval step ---
+@tf.function
+def eval_step_teacher(x_clean, y, attack_name):
+    x_adv = make_adv_batch(x_clean, y, attack_name)
+    delta_hat = D([x_clean, x_adv], training=False)
+    total, l_delta, l_adv, l1, delta_true, x_adv_hat = teacher_losses(x_clean, x_adv, delta_hat)
+
+    delta_mae = tf.reduce_mean(tf.abs(delta_true - delta_hat))
+    delta_max = tf.reduce_mean(tf.reduce_max(tf.abs(delta_true - delta_hat), axis=[1, 2, 3]))
+    adv_psnr  = tf.reduce_mean(tf.image.psnr(x_adv, x_adv_hat, max_val=1.0))
+    return total, l_delta, l_adv, delta_mae, delta_max, adv_psnr
+
+# =========================
+# ALWAYS RETRAIN (ignore / delete any saved checkpoint)
+# =========================
+xb, yb = next(iter(train_ds))
+x_adv = make_adv_batch(xb, yb, "fgsm")
+
+print("clean range:", float(tf.reduce_min(xb)), float(tf.reduce_max(xb)))
+print("adv   range:", float(tf.reduce_min(x_adv)), float(tf.reduce_max(x_adv)))
+print("mean |delta|:", float(tf.reduce_mean(tf.abs(x_adv - xb))))
+
+# Optional but recommended: delete old checkpoint to avoid confusion later
+if os.path.exists(CFG.delta_path):
+    try:
+        os.remove(CFG.delta_path)
+        print("Deleted old teacher checkpoint:", CFG.delta_path)
+    except Exception as e:
+        print("Could not delete old teacher checkpoint (continuing anyway):", e)
+
+# IMPORTANT:
+# This cell assumes D and optD already exist (built earlier).
+# If you want a fresh-from-scratch teacher, rebuild D + optD BEFORE this loop.
+
+for epoch in range(1, CFG.delta_epochs + 1):
+    tr = []
+    for xb, yb in tqdm(train_ds, desc=f"Teacher Train {epoch}/{CFG.delta_epochs}"):
+        total, l_delta, l_adv, l1 = train_step_teacher(xb, yb)
+        tr.append([float(total), float(l_delta), float(l_adv), float(l1)])
+    tr = np.mean(tr, axis=0)
+
+    def eval_attack(name):
+        ev = []
+        for xb, yb in val_ds:
+            out = eval_step_teacher(xb, yb, name)
+            ev.append([float(x) for x in out])
+        return np.mean(ev, axis=0)
+
+    fg = eval_attack("fgsm")
+    pg = eval_attack("pgd")
+
+    print(f"\nEpoch {epoch:02d}: train total={tr[0]:.4f} (delta={tr[1]:.4f} adv={tr[2]:.4f} l1={tr[3]:.4f})")
+    print(f"  Val FGSM: total={fg[0]:.4f} delta_loss={fg[1]:.4f} adv_loss={fg[2]:.4f} delta_MAE={fg[3]:.4f} maxErr={fg[4]:.4f} PSNR(xadv)={fg[5]:.2f}")
+    print(f"  Val PGD : total={pg[0]:.4f} delta_loss={pg[1]:.4f} adv_loss={pg[2]:.4f} delta_MAE={pg[3]:.4f} maxErr={pg[4]:.4f} PSNR(xadv)={pg[5]:.2f}")
+
+# save at end
+D.save(CFG.delta_path)
+print("Saved teacher delta predictor:", CFG.delta_path)
+# =========================
+# CELL 7 — Teacher test + visualize (paired)
+# =========================
+def test_metrics_teacher(attack_name):
+    outs = []
+    for xb, yb in test_ds:
+        out = eval_step_teacher(xb, yb, attack_name)
+        outs.append([float(x) for x in out])
+    outs = np.mean(outs, axis=0)
+    print(f"[TEACHER TEST {attack_name.upper()}] total={outs[0]:.4f} delta_loss={outs[1]:.4f} adv_loss={outs[2]:.4f} delta_MAE={outs[3]:.4f} maxErr={outs[4]:.4f} PSNR(xadv)={outs[5]:.2f}")
+
+test_metrics_teacher("fgsm")
+test_metrics_teacher("pgd")
+
+for xb, yb in test_ds.take(1):
+    x_clean = xb[:1]
+    y = yb[:1]
+    break
+
+x_adv_f = make_adv_batch(x_clean, y, "fgsm")
+x_adv_p = make_adv_batch(x_clean, y, "pgd")
+
+delta_hat_f = D([x_clean, x_adv_f], training=False)
+delta_hat_p = D([x_clean, x_adv_p], training=False)
+
+delta_true_f = x_adv_f - x_clean
+delta_true_p = x_adv_p - x_clean
+
+def show_delta_pair(delta_true, delta_pred, eps, title, x_adv):
+    delta_true = tf.squeeze(delta_true)
+    delta_pred = tf.squeeze(delta_pred)
+    x0 = tf.squeeze(x_clean)
+    xa = tf.squeeze(x_adv)
+
+    plt.figure(figsize=(12,3))
+    plt.subplot(1,4,1); plt.imshow(x0.numpy()); plt.title("clean"); plt.axis("off")
+    plt.subplot(1,4,2); plt.imshow(xa.numpy()); plt.title(f"{title} x_adv"); plt.axis("off")
+    plt.subplot(1,4,3); plt.imshow(tf.abs(delta_true).numpy(), cmap="magma", vmin=0, vmax=eps)
+    plt.title(f"{title} true |δ|\nmax={tf.reduce_max(tf.abs(delta_true)).numpy():.3f}")
+    plt.axis("off")
+    plt.subplot(1,4,4); plt.imshow(tf.abs(delta_pred).numpy(), cmap="magma", vmin=0, vmax=eps)
+    plt.title(f"{title} pred |δ|\nmax={tf.reduce_max(tf.abs(delta_pred)).numpy():.3f}")
+    plt.axis("off")
+    plt.show()
+
+show_delta_pair(delta_true_f, delta_hat_f, CFG.eps, "FGSM", x_adv_f)
+show_delta_pair(delta_true_p, delta_hat_p, CFG.eps, "PGD",  x_adv_p)
+
+def show_rebuild(x_adv, delta_hat, title):
+    x0 = tf.squeeze(x_clean)
+    xa = tf.squeeze(x_adv)
+    x_adv_hat = tf.clip_by_value(x_clean + delta_hat, 0.0, 1.0)
+    xh = tf.squeeze(x_adv_hat)
+
+    plt.figure(figsize=(10,3))
+    plt.subplot(1,3,1); plt.imshow(x0.numpy()); plt.title("clean"); plt.axis("off")
+    plt.subplot(1,3,2); plt.imshow(xa.numpy()); plt.title(f"{title} x_adv"); plt.axis("off")
+    plt.subplot(1,3,3); plt.imshow(xh.numpy()); plt.title(f"{title} clean+δ̂"); plt.axis("off")
+    plt.show()
+
+show_rebuild(x_adv_f, delta_hat_f, "FGSM")
+show_rebuild(x_adv_p, delta_hat_p, "PGD")
+# =========================
+# CELL 8 — Student model (adv-only): D_adv(x_adv) -> delta in [-eps, eps]
+# =========================
+student_epochs = 1
+def conv_block_simple(x, f):
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def build_delta_student():
+    inp = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
+
+    c1 = conv_block_simple(inp, 64);  p1 = layers.MaxPool2D()(c1)
+    c2 = conv_block_simple(p1, 128); p2 = layers.MaxPool2D()(c2)
+    b  = conv_block_simple(p2, 256)
+
+    u2 = layers.UpSampling2D()(b);   u2 = layers.Concatenate()([u2, c2])
+    c3 = conv_block_simple(u2, 128)
+
+    u1 = layers.UpSampling2D()(c3);  u1 = layers.Concatenate()([u1, c1])
+    c4 = conv_block_simple(u1, 64)
+
+    out = layers.Conv2D(3, 1, padding="same")(c4)
+    out = layers.Activation("tanh")(out)
+    out = layers.Lambda(lambda t: t * CFG.eps, name="delta_hat")(out)
+    return keras.Model(inp, out, name="delta_student_adv_only")
+
+D_adv = build_delta_student()
+optS = keras.optimizers.Adam(CFG.lr_student)
+D_adv.summary()
+# =========================
+# CELL 9 — Student training (teacher-supervised + consistency)
+# FGSM + PGD ONLY (NO C&W)
+# =========================
+import os
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+
+@tf.function
+def student_losses(x_clean, x_adv):
+    # teacher label
+    delta_t = tf.stop_gradient(D([x_clean, x_adv], training=False))
+    # student predicts from x_adv only
+    delta_s = D_adv(x_adv, training=True)
+
+    # (1) match teacher delta
+    loss_delta = tf.reduce_mean(tf.square(delta_s - delta_t))
+
+    # (2) reconstruction loss
+    x_adv_hat = tf.clip_by_value(x_clean + delta_s, 0.0, 1.0)
+    loss_adv = tf.reduce_mean(tf.square(x_adv - x_adv_hat))
+
+    # (3) self-consistency
+    x_pur = tf.clip_by_value(x_adv - delta_s, 0.0, 1.0)
+    delta_resid = D_adv(x_pur, training=True)
+    loss_cons = tf.reduce_mean(tf.square(delta_resid))
+
+    # regularizer
+    loss_l1 = tf.reduce_mean(tf.abs(delta_s))
+
+    total = (
+        1.0 * loss_delta +
+        0.5 * loss_adv +
+        0.5 * loss_cons +
+        0.001 * loss_l1
+    )
+    return total, loss_delta, loss_adv, loss_cons, loss_l1
+
+
+# --- train step (NO C&W) ---
+def train_step_student(x_clean, y):
+    bs = tf.shape(x_clean)[0]
+    half = bs // 2
+
+    # split batch: FGSM / PGD
+    x1, y1 = x_clean[:half], y[:half]
+    x2, y2 = x_clean[half:], y[half:]
+
+    x_adv1 = make_adv_batch(x1, y1, "fgsm")
+    x_adv2 = make_adv_batch(x2, y2, "pgd")
+
+    x_adv = tf.concat([x_adv1, x_adv2], axis=0)
+
+    with tf.GradientTape() as tape:
+        total, l_del, l_adv, l_cons, l1 = student_losses(x_clean, x_adv)
+
+    grads = tape.gradient(total, D_adv.trainable_variables)
+    optS.apply_gradients(zip(grads, D_adv.trainable_variables))
+
+    return total, l_del, l_adv, l_cons, l1
+
+
+# =========================
+# ALWAYS RETRAIN
+# =========================
+
+if os.path.exists(CFG.student_path):
+    try:
+        os.remove(CFG.student_path)
+        print("Deleted old student checkpoint:", CFG.student_path)
+    except Exception:
+        pass
+
+for epoch in range(1, CFG.student_epochs + 1):
+    tr = []
+    for xb, yb in tqdm(train_ds, desc=f"Student Train {epoch}/{CFG.student_epochs}"):
+        out = train_step_student(xb, yb)
+        tr.append([float(x) for x in out])
+    tr = np.mean(tr, axis=0)
+
+    print(
+        f"Epoch {epoch:02d} | "
+        f"total={tr[0]:.4f} delta={tr[1]:.4f} "
+        f"adv={tr[2]:.4f} cons={tr[3]:.4f} l1={tr[4]:.4f}"
+    )
+
+D_adv.save(CFG.student_path)
+print("Saved student:", CFG.student_path)
+# =========================
+# CELL 11 — Batch eval: FGSM/PGD accuracy recovery with student (adv-only)
+# =========================
+@tf.function
+def purify_batch_student(x_adv):
+    delta_hat = D_adv(x_adv, training=False)
+    return tf.clip_by_value(x_adv - delta_hat, 0.0, 1.0)
+
+def eval_defense_on_attack(attack_name):
+    clean_acc, adv_acc, pur_acc = [], [], []
+    for xb, yb in test_ds:
+        x_adv = make_adv_batch(xb, yb, attack_name)
+        x_pur = purify_batch_student(x_adv)
+
+        pred_clean = tf.argmax(clf(xb, training=False), axis=1, output_type=tf.int32)
+        pred_adv   = tf.argmax(clf(x_adv, training=False), axis=1, output_type=tf.int32)
+        pred_pur   = tf.argmax(clf(x_pur, training=False), axis=1, output_type=tf.int32)
+
+        clean_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_clean, yb), tf.float32)))
+        adv_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_adv, yb), tf.float32)))
+        pur_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_pur, yb), tf.float32)))
+
+    print(f"[DEFENSE eval on {attack_name.upper()}]")
+    print(" clean_acc:", float(tf.reduce_mean(clean_acc)))
+    print("   adv_acc:", float(tf.reduce_mean(adv_acc)))
+    print("   pur_acc:", float(tf.reduce_mean(pur_acc)))
+
+eval_defense_on_attack("fgsm")
+eval_defense_on_attack("pgd")
+# =========================
+# CELL — Build masked reconstructor R (delta-gated)
+# =========================
+from tensorflow import keras
+from tensorflow.keras import layers
+import tensorflow as tf
+
+def build_reconstructor_masked():
+    x_adv_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
+    delta_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="delta_hat")
+
+    # features from both
+    x = layers.Concatenate()([x_adv_in, delta_in])
+
+    # small conv stack (fast on CIFAR)
+    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+
+    # gate mask: where to apply delta correction (0..1)
+    gate = layers.Conv2D(1, 1, padding="same", activation="sigmoid", name="gate")(x)
+    gate3 = layers.Concatenate()([gate, gate, gate])  # broadcast to 3 channels
+
+    # deterministic correction using predicted delta (no repainting whole image)
+    def apply_delta(inputs):
+        x_adv, gate3, delta = inputs
+        return tf.clip_by_value(x_adv - gate3 * delta, 0.0, 1.0)
+
+    x_rec = layers.Lambda(apply_delta, output_shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_rec")(
+        [x_adv_in, gate3, delta_in]
+    )
+
+    return keras.Model([x_adv_in, delta_in], x_rec, name="R_masked")
+
+R = build_reconstructor_masked()
+optR = keras.optimizers.Adam(2e-4)
+R.summary()
+@tf.function
+def train_step_R(x_clean, y):
+    # build mixed FGSM/PGD adversarial batch
+    bs = tf.shape(x_clean)[0]
+    half = bs // 2
+    x1, y1 = x_clean[:half], y[:half]
+    x2, y2 = x_clean[half:], y[half:]
+
+    x_adv1 = make_adv_batch(x1, y1, "fgsm")
+    x_adv2 = make_adv_batch(x2, y2, "pgd")
+    x_adv  = tf.concat([x_adv1, x_adv2], axis=0)
+
+    # predicted perturbation from adv-only student
+    delta_hat = tf.stop_gradient(D_adv(x_adv, training=False))
+
+    with tf.GradientTape() as tape:
+        x_clean_hat = R([x_adv, delta_hat], training=True)
+
+        # pixel loss (L1 tends to preserve edges better than L2)
+        loss_pix = tf.reduce_mean(tf.abs(x_clean_hat - x_clean))
+
+        # optional: classifier consistency (helps preserve semantics)
+        logits = clf(x_clean_hat, training=False)
+        loss_cls = tf.reduce_mean(loss_fn(y, logits))
+
+        total = loss_pix + 0.1 * loss_cls
+
+    grads = tape.gradient(total, R.trainable_variables)
+    optR.apply_gradients(zip(grads, R.trainable_variables))
+    return total, loss_pix, loss_cls
+R_epochs = 20  # start small
+for epoch in range(1, R_epochs + 1):
+    tr = []
+    for xb, yb in tqdm(train_ds, desc=f"R Train {epoch}/{R_epochs}"):
+        total, lpix, lcls = train_step_R(xb, yb)
+        tr.append([float(total), float(lpix), float(lcls)])
+    tr = np.mean(tr, axis=0)
+    print(f"Epoch {epoch:02d} | total={tr[0]:.4f} pix={tr[1]:.4f} cls={tr[2]:.4f}")
