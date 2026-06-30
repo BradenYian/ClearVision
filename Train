@@ -91,22 +91,135 @@ print(x_tr.shape, x_va.shape, x_te.shape)
 train_ds = tf.data.Dataset.from_tensor_slices((x_tr, y_tr)).shuffle(10000, seed=SEED).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
 val_ds   = tf.data.Dataset.from_tensor_slices((x_va, y_va)).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
 test_ds  = tf.data.Dataset.from_tensor_slices((x_te, y_te)).batch(CFG.batch_size).prefetch(tf.data.AUTOTUNE)
-
-!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
+# =========================
+# CELL 3 — Classifier (EfficientNetV2 backbone)
+# USE SAVED MODEL if available; otherwise train
+# =========================
+import os
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.applications import EfficientNetV2S
 from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+from tqdm.keras import TqdmCallback
 
-# =========================
-# Custom layer (needed for classifier)
-# =========================
+# ---- Keras-serializable preprocess layer (Keras 3 safe) ----
 @keras.utils.register_keras_serializable(package="custom")
 class EffNetV2Preprocess(layers.Layer):
     def call(self, inputs):
         inputs = tf.cast(inputs, tf.float32)
+        # IMPORTANT: your pipeline provides [0,1] (because you divided by 255 earlier),
+        # but preprocess_input expects [0,255]. So convert here:
         return preprocess_input(inputs * 255.0)
 
     def get_config(self):
         return super().get_config()
-!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
+
+def build_classifier_efficientnetv2(
+    input_size=224,
+    dropout=0.3,
+    wd=1e-4,
+    weights="imagenet",
+    freeze_backbone=True
+):
+    inp = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="image")
+
+    x = layers.Resizing(input_size, input_size, name="resize")(inp)
+    x = EffNetV2Preprocess(name="effnetv2_preprocess")(x)
+
+    backbone = EfficientNetV2S(
+        include_top=False,
+        weights=weights,
+        input_shape=(input_size, input_size, 3),
+        pooling="avg",
+    )
+    backbone.trainable = not freeze_backbone
+
+    # BN stability when frozen
+    feats = backbone(x, training=False if freeze_backbone else True)
+
+    h = layers.Dense(
+        256, activation="relu",
+        kernel_regularizer=keras.regularizers.l2(wd),
+        name="head_dense",
+    )(feats)
+    h = layers.Dropout(dropout, name="head_dropout")(h)
+    out = layers.Dense(CFG.num_classes, name="logits")(h)
+
+    model = keras.Model(inp, out, name="effnetv2s_classifier")
+    return model, backbone
+
+def compile_classifier(m, lr=1e-3):
+    m.compile(
+        optimizer=keras.optimizers.Adam(lr),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+
+# --- quick sanity check: make sure labels/ranges look right ---
+xb, yb = next(iter(train_ds))
+print("sanity x range:", float(tf.reduce_min(xb)), float(tf.reduce_max(xb)))  # should be ~0..1
+print("sanity y shape/dtype:", yb.shape, yb.dtype)
+print("sanity y min/max:", int(tf.reduce_min(yb)), int(tf.reduce_max(yb)))   # should be 0..9
+
+# --- Try to load saved model first ---
+clf = None
+if hasattr(CFG, "clf_path") and CFG.clf_path and os.path.exists(CFG.clf_path):
+    try:
+        clf = keras.models.load_model(CFG.clf_path)
+        print("Loaded saved classifier:", CFG.clf_path)
+    except Exception as e:
+        print("Failed to load saved classifier. Will retrain. Error:", repr(e))
+        clf = None
+else:
+    print("No saved classifier found at:", getattr(CFG, "clf_path", None))
+
+# --- If not loaded, train and save ---
+if clf is None:
+    clf, backbone = build_classifier_efficientnetv2(
+        input_size=224,
+        dropout=0.3,
+        wd=1e-4,
+        weights="imagenet",
+        freeze_backbone=True,
+    )
+    compile_classifier(clf, lr=1e-3)
+
+    clf.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=CFG.clf_epochs,
+        callbacks=[TqdmCallback(verbose=1)],
+        verbose=0,
+    )
+
+    # Optional fine-tuning
+    if getattr(CFG, "clf_finetune_epochs", 0) and CFG.clf_finetune_epochs > 0:
+        backbone.trainable = True
+        compile_classifier(clf, lr=1e-4)
+        clf.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CFG.clf_epochs + CFG.clf_finetune_epochs,
+            initial_epoch=CFG.clf_epochs,
+            callbacks=[TqdmCallback(verbose=1)],
+            verbose=0,
+        )
+
+    clf.save(CFG.clf_path)
+    print("Saved classifier:", CFG.clf_path)
+
+# Ensure model is compiled
+try:
+    compile_classifier(clf, lr=1e-3)
+except Exception:
+    pass
+
+test_acc = clf.evaluate(test_ds, verbose=0)[1]
+print("Classifier test acc:", test_acc)
+# =========================
+# CELL 4 — Attacks (FGSM/PGD + fast "C&W-ish" L2)
+# =========================
 loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
 
 @tf.function
@@ -135,22 +248,97 @@ def pgd_attack(model, x, y, eps, steps, alpha):
         x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
     return x_adv
 
+@tf.function
+def cw_l2_attack_batch(
+    model, x, y,
+    steps=10,          # FAST
+    alpha=0.02,        # step size in L2 space
+    eps_l2=1.5,        # L2 budget per image (tune)
+    clip_min=0.0,
+    clip_max=1.0,
+    eps_linf=None      # optional: also enforce Linf (e.g., CFG.eps)
+):
+    """
+    Fast untargeted L2 attack (PGD-L2 style).
+    Much faster than true C&W but captures L2-type perturbations.
+    """
+    x = tf.cast(x, tf.float32)
+    y = tf.cast(y, tf.int32)
+
+    # random L2 init inside eps_l2 ball
+    r = tf.random.normal(tf.shape(x))
+    r_flat = tf.reshape(r, [tf.shape(x)[0], -1])
+    r_norm = tf.norm(r_flat, ord=2, axis=1, keepdims=True) + 1e-12
+    r_unit = r_flat / r_norm
+    rad = tf.random.uniform([tf.shape(x)[0], 1], 0.0, eps_l2)
+    r = tf.reshape(r_unit * rad, tf.shape(x))
+
+    x_adv = tf.clip_by_value(x + r, clip_min, clip_max)
+
+    for _ in tf.range(tf.cast(steps, tf.int32)):
+        with tf.GradientTape() as tape:
+            tape.watch(x_adv)
+            logits = model(x_adv, training=False)
+            loss = tf.reduce_mean(loss_fn(y, logits))
+        grad = tape.gradient(loss, x_adv)
+
+        # L2-normalized gradient step
+        g_flat = tf.reshape(grad, [tf.shape(x)[0], -1])
+        g_norm = tf.norm(g_flat, ord=2, axis=1, keepdims=True) + 1e-12
+        g_unit = g_flat / g_norm
+        g_unit = tf.reshape(g_unit, tf.shape(x))
+
+        x_adv = x_adv + alpha * g_unit
+
+        # project back to L2 ball around x
+        d = x_adv - x
+        d_flat = tf.reshape(d, [tf.shape(x)[0], -1])
+        d_norm = tf.norm(d_flat, ord=2, axis=1, keepdims=True) + 1e-12
+        factor = tf.minimum(1.0, eps_l2 / d_norm)
+        d = tf.reshape(d_flat * factor, tf.shape(x))
+        x_adv = x + d
+
+        # optional Linf clamp too
+        if eps_linf is not None:
+            x_adv = tf.clip_by_value(x_adv, x - eps_linf, x + eps_linf)
+
+        x_adv = tf.clip_by_value(x_adv, clip_min, clip_max)
+
+    return x_adv
+
 def make_adv_batch(x, y, attack_name):
     eps = tf.constant(CFG.eps, tf.float32)
 
     if attack_name == "fgsm":
-        return fgsm_attack(attack_clf, x, y, eps)
+        return fgsm_attack(clf, x, y, eps)
 
     elif attack_name == "pgd":
         return pgd_attack(
-            attack_clf, x, y,
+            clf, x, y,
             eps,
             tf.constant(CFG.pgd_steps, tf.int32),
             tf.constant(CFG.pgd_alpha, tf.float32),
         )
 
+    elif attack_name == "cw":
+        cw_steps  = getattr(CFG, "cw_steps", 10)
+        cw_alpha  = getattr(CFG, "cw_alpha", 0.02)
+        cw_eps_l2 = getattr(CFG, "cw_eps_l2", 1.5)
+
+        # optional: also enforce Linf=CFG.eps (or set None for pure L2)
+        eps_linf = getattr(CFG, "cw_eps_linf", None)
+
+        return cw_l2_attack_batch(
+            clf, x, y,
+            steps=cw_steps,
+            alpha=cw_alpha,
+            eps_l2=cw_eps_l2,
+            clip_min=0.0, clip_max=1.0,
+            eps_linf=eps_linf
+        )
+
     else:
-        raise ValueError("attack_name must be 'fgsm' or 'pgd'")
+        raise ValueError("attack_name must be 'fgsm', 'pgd', or 'cw'")
 # =========================
 # CELL 5 — Teacher delta model (paired): D([x_clean, x_adv]) -> delta in [-eps, eps]
 # =========================
@@ -358,7 +546,6 @@ show_rebuild(x_adv_p, delta_hat_p, "PGD")
 # =========================
 # CELL 8 — Student model (adv-only): D_adv(x_adv) -> delta in [-eps, eps]
 # =========================
-student_epochs = 1
 def conv_block_simple(x, f):
     x = layers.Conv2D(f, 3, padding="same")(x)
     x = layers.BatchNormalization()(x)
@@ -390,8 +577,7 @@ D_adv = build_delta_student()
 optS = keras.optimizers.Adam(CFG.lr_student)
 D_adv.summary()
 # =========================
-# CELL 9 — Student training (teacher-supervised + consistency)
-# FGSM + PGD ONLY (NO C&W)
+# CELL 9 — Student training (teacher-supervised + consistency) — ALWAYS RETRAIN
 # =========================
 import os
 import numpy as np
@@ -408,60 +594,61 @@ def student_losses(x_clean, x_adv):
     # (1) match teacher delta
     loss_delta = tf.reduce_mean(tf.square(delta_s - delta_t))
 
-    # (2) reconstruction loss
+    # (2) train-time reconstruction of x_adv (uses x_clean only in training)
     x_adv_hat = tf.clip_by_value(x_clean + delta_s, 0.0, 1.0)
     loss_adv = tf.reduce_mean(tf.square(x_adv - x_adv_hat))
 
-    # (3) self-consistency
+    # (3) self-consistency: after removing predicted delta, residual should be small
     x_pur = tf.clip_by_value(x_adv - delta_s, 0.0, 1.0)
     delta_resid = D_adv(x_pur, training=True)
     loss_cons = tf.reduce_mean(tf.square(delta_resid))
 
-    # regularizer
+    # light regularizer
     loss_l1 = tf.reduce_mean(tf.abs(delta_s))
 
-    total = (
-        1.0 * loss_delta +
-        0.5 * loss_adv +
-        0.5 * loss_cons +
-        0.001 * loss_l1
-    )
+    total = (1.0 * loss_delta) + (0.5 * loss_adv) + (0.5 * loss_cons) + (0.001 * loss_l1)
     return total, loss_delta, loss_adv, loss_cons, loss_l1
 
-
-# --- train step (NO C&W) ---
+# --- train step (NO @tf.function so C&W can run) ---
 def train_step_student(x_clean, y):
     bs = tf.shape(x_clean)[0]
-    half = bs // 2
 
-    # split batch: FGSM / PGD
-    x1, y1 = x_clean[:half], y[:half]
-    x2, y2 = x_clean[half:], y[half:]
+    third = bs // 3
+    two_third = 2 * third
+
+    x1, y1 = x_clean[:third],      y[:third]
+    x2, y2 = x_clean[third:two_third], y[third:two_third]
+    x3, y3 = x_clean[two_third:],  y[two_third:]
 
     x_adv1 = make_adv_batch(x1, y1, "fgsm")
     x_adv2 = make_adv_batch(x2, y2, "pgd")
+    x_adv3 = make_adv_batch(x3, y3, "cw")
 
-    x_adv = tf.concat([x_adv1, x_adv2], axis=0)
+    x_adv = tf.concat([x_adv1, x_adv2, x_adv3], axis=0)
 
     with tf.GradientTape() as tape:
         total, l_del, l_adv, l_cons, l1 = student_losses(x_clean, x_adv)
 
     grads = tape.gradient(total, D_adv.trainable_variables)
     optS.apply_gradients(zip(grads, D_adv.trainable_variables))
-
     return total, l_del, l_adv, l_cons, l1
 
 
 # =========================
-# ALWAYS RETRAIN
+# ALWAYS RETRAIN (ignore / delete any saved checkpoint)
 # =========================
 
+# Optional but recommended: delete old checkpoint to avoid accidental load later
 if os.path.exists(CFG.student_path):
     try:
         os.remove(CFG.student_path)
         print("Deleted old student checkpoint:", CFG.student_path)
-    except Exception:
-        pass
+    except Exception as e:
+        print("Could not delete old student checkpoint (continuing anyway):", e)
+
+# IMPORTANT:
+# This cell assumes D_adv and optS already exist (built earlier).
+# If you want a fresh-from-scratch student, rebuild D_adv + optS BEFORE this loop.
 
 for epoch in range(1, CFG.student_epochs + 1):
     tr = []
@@ -470,78 +657,44 @@ for epoch in range(1, CFG.student_epochs + 1):
         tr.append([float(x) for x in out])
     tr = np.mean(tr, axis=0)
 
-    print(
-        f"Epoch {epoch:02d} | "
-        f"total={tr[0]:.4f} delta={tr[1]:.4f} "
-        f"adv={tr[2]:.4f} cons={tr[3]:.4f} l1={tr[4]:.4f}"
-    )
+    print(f"Epoch {epoch:02d} | total={tr[0]:.4f} delta={tr[1]:.4f} adv={tr[2]:.4f} cons={tr[3]:.4f} l1={tr[4]:.4f}")
 
+# save at end
 D_adv.save(CFG.student_path)
 print("Saved student:", CFG.student_path)
-# =========================
-# CELL 11 — Batch eval: FGSM/PGD accuracy recovery with student (adv-only)
-# =========================
-@tf.function
-def purify_batch_student(x_adv):
-    delta_hat = D_adv(x_adv, training=False)
-    return tf.clip_by_value(x_adv - delta_hat, 0.0, 1.0)
-
-def eval_defense_on_attack(attack_name):
-    clean_acc, adv_acc, pur_acc = [], [], []
-    for xb, yb in test_ds:
-        x_adv = make_adv_batch(xb, yb, attack_name)
-        x_pur = purify_batch_student(x_adv)
-
-        pred_clean = tf.argmax(clf(xb, training=False), axis=1, output_type=tf.int32)
-        pred_adv   = tf.argmax(clf(x_adv, training=False), axis=1, output_type=tf.int32)
-        pred_pur   = tf.argmax(clf(x_pur, training=False), axis=1, output_type=tf.int32)
-
-        clean_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_clean, yb), tf.float32)))
-        adv_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_adv, yb), tf.float32)))
-        pur_acc.append(tf.reduce_mean(tf.cast(tf.equal(pred_pur, yb), tf.float32)))
-
-    print(f"[DEFENSE eval on {attack_name.upper()}]")
-    print(" clean_acc:", float(tf.reduce_mean(clean_acc)))
-    print("   adv_acc:", float(tf.reduce_mean(adv_acc)))
-    print("   pur_acc:", float(tf.reduce_mean(pur_acc)))
-
-eval_defense_on_attack("fgsm")
-eval_defense_on_attack("pgd")
-# =========================
-# CELL — Build masked reconstructor R (delta-gated)
-# =========================
 from tensorflow import keras
 from tensorflow.keras import layers
 import tensorflow as tf
 
-def build_reconstructor_masked():
+def recon_block(x, f):
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def build_reconstructor():
     x_adv_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
-    delta_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="delta_hat")
+    d_in     = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="delta_hat")
 
-    # features from both
-    x = layers.Concatenate()([x_adv_in, delta_in])
+    # helpful extra: naive cleaned guess
+    x_naive = layers.Subtract()([x_adv_in, d_in])
 
-    # small conv stack (fast on CIFAR)
-    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
-    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
-    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    inp = layers.Concatenate()([x_adv_in, d_in, x_naive])
 
-    # gate mask: where to apply delta correction (0..1)
-    gate = layers.Conv2D(1, 1, padding="same", activation="sigmoid", name="gate")(x)
-    gate3 = layers.Concatenate()([gate, gate, gate])  # broadcast to 3 channels
+    c1 = recon_block(inp, 64);  p1 = layers.MaxPool2D()(c1)
+    c2 = recon_block(p1, 128);  p2 = layers.MaxPool2D()(c2)
+    b  = recon_block(p2, 256)
 
-    # deterministic correction using predicted delta (no repainting whole image)
-    def apply_delta(inputs):
-        x_adv, gate3, delta = inputs
-        return tf.clip_by_value(x_adv - gate3 * delta, 0.0, 1.0)
+    u2 = layers.UpSampling2D()(b);  u2 = layers.Concatenate()([u2, c2])
+    c3 = recon_block(u2, 128)
 
-    x_rec = layers.Lambda(apply_delta, output_shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_rec")(
-        [x_adv_in, gate3, delta_in]
-    )
+    u1 = layers.UpSampling2D()(c3); u1 = layers.Concatenate()([u1, c1])
+    c4 = recon_block(u1, 64)
 
-    return keras.Model([x_adv_in, delta_in], x_rec, name="R_masked")
+    out = layers.Conv2D(3, 1, padding="same", activation="sigmoid")(c4)
+    return keras.Model([x_adv_in, d_in], out, name="attack_remover_R")
 
-R = build_reconstructor_masked()
+R = build_reconstructor()
 optR = keras.optimizers.Adam(2e-4)
 R.summary()
 @tf.function
@@ -582,3 +735,110 @@ for epoch in range(1, R_epochs + 1):
         tr.append([float(total), float(lpix), float(lcls)])
     tr = np.mean(tr, axis=0)
     print(f"Epoch {epoch:02d} | total={tr[0]:.4f} pix={tr[1]:.4f} cls={tr[2]:.4f}")
+# pick one
+for xb, yb in test_ds.take(1):
+    x_clean = xb[:1]
+    y = yb[:1]
+    break
+
+x_adv_sq = square_attack_single(clf, x_clean, y, eps=CFG.eps, steps=400, p_init=0.8)
+
+# attack-only pipeline
+delta_hat = D_adv(x_adv_sq, training=False)
+x_hat = R([x_adv_sq, delta_hat], training=False)
+
+pred_clean = int(tf.argmax(clf(x_clean, training=False), axis=1).numpy()[0])
+pred_adv   = int(tf.argmax(clf(x_adv_sq, training=False), axis=1).numpy()[0])
+pred_hat   = int(tf.argmax(clf(x_hat, training=False), axis=1).numpy()[0])
+
+print("y true:", int(y.numpy()[0]))
+print("pred clean:", pred_clean)
+print("pred adv  :", pred_adv)
+print("pred recon:", pred_hat)
+print("MAE(recon vs clean):", float(tf.reduce_mean(tf.abs(x_hat - x_clean))))
+
+# visualize
+x0 = tf.squeeze(x_clean).numpy()
+xa = tf.squeeze(x_adv_sq).numpy()
+xh = tf.squeeze(x_hat).numpy()
+
+plt.figure(figsize=(9,3))
+plt.subplot(1,3,1); plt.imshow(x0); plt.title("clean"); plt.axis("off")
+plt.subplot(1,3,2); plt.imshow(xa); plt.title("Square x_adv"); plt.axis("off")
+plt.subplot(1,3,3); plt.imshow(xh); plt.title("R(x_adv, δ̂)"); plt.axis("off")
+plt.tight_layout()
+plt.show()
+# =========================
+# CELL — Full test-set evaluation:
+# 1) generate adversarial set (FGSM/PGD)
+# 2) predict deltas with D_adv
+# 3) reconstruct with R
+# 4) report accuracies + recon metrics
+# =========================
+import numpy as np
+import tensorflow as tf
+
+def eval_pipeline_on_attack(attack_name, max_batches=None):
+    clean_accs, adv_accs, rec_accs = [], [], []
+    delta_maes, rec_maes, rec_psnrs = [], [], []
+
+    b = 0
+    for xb, yb in test_ds:
+        # 1) make adversarial
+        x_adv = make_adv_batch(xb, yb, attack_name)
+
+        # 2) predict attack (delta) from adv-only student
+        delta_hat = D_adv(x_adv, training=False)
+
+        # 3) reconstruct clean using reconstructor (attack-only inputs)
+        x_rec = R([x_adv, delta_hat], training=False)
+        x_rec = tf.clip_by_value(x_rec, 0.0, 1.0)
+
+        # ---- metrics ----
+        # classifier preds
+        pred_clean = tf.argmax(clf(xb, training=False), axis=1, output_type=tf.int32)
+        pred_adv   = tf.argmax(clf(x_adv, training=False), axis=1, output_type=tf.int32)
+        pred_rec   = tf.argmax(clf(x_rec, training=False), axis=1, output_type=tf.int32)
+
+        clean_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_clean, yb), tf.float32)))
+        adv_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_adv, yb), tf.float32)))
+        rec_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_rec, yb), tf.float32)))
+
+        # delta quality (needs clean only for eval)
+        delta_true = x_adv - xb
+        delta_maes.append(tf.reduce_mean(tf.abs(delta_true - delta_hat)))
+
+        # reconstruction quality
+        rec_maes.append(tf.reduce_mean(tf.abs(x_rec - xb)))
+        rec_psnrs.append(tf.reduce_mean(tf.image.psnr(xb, x_rec, max_val=1.0)))
+
+        b += 1
+        if max_batches is not None and b >= max_batches:
+            break
+
+    print(f"\n[PIPELINE eval on {attack_name.upper()}]")
+    print(" clean_acc:", float(tf.reduce_mean(clean_accs)))
+    print("   adv_acc:", float(tf.reduce_mean(adv_accs)))
+    print("   rec_acc:", float(tf.reduce_mean(rec_accs)))
+    print(" delta_MAE (true vs hat):", float(tf.reduce_mean(delta_maes)))
+    print(" recon_MAE (rec vs clean):", float(tf.reduce_mean(rec_maes)))
+    print(" PSNR(rec vs clean):", float(tf.reduce_mean(rec_psnrs)))
+
+# Run on FGSM and PGD (fast, batched)
+eval_pipeline_on_attack("fgsm")
+eval_pipeline_on_attack("pgd")
+import os
+
+os.makedirs(CFG.out_dir, exist_ok=True)
+
+BASE_PATH = os.path.join(CFG.out_dir, "base_classifier.keras")
+PRED_PATH = os.path.join(CFG.out_dir, "attack_predictor_D_adv.keras")
+REC_PATH  = os.path.join(CFG.out_dir, "reconstructor_R.keras")
+
+clf.save(BASE_PATH)
+D_adv.save(PRED_PATH)
+R.save(REC_PATH)
+
+print("Saved base classifier  ->", BASE_PATH)
+print("Saved attack predictor ->", PRED_PATH)
+print("Saved reconstructor    ->", REC_PATH)
