@@ -1,0 +1,119 @@
+loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
+
+@tf.function
+def fgsm_attack(model, x, y, eps):
+    with tf.GradientTape() as tape:
+        tape.watch(x)
+        logits = model(x, training=False)
+        loss = tf.reduce_mean(loss_fn(y, logits))
+    grad = tape.gradient(loss, x)
+    x_adv = x + eps * tf.sign(grad)
+    return tf.clip_by_value(x_adv, 0.0, 1.0)
+
+@tf.function
+def pgd_attack(model, x, y, eps, steps, alpha):
+    x_adv = x + tf.random.uniform(tf.shape(x), -eps, eps)
+    x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+
+    for _ in tf.range(tf.cast(steps, tf.int32)):
+        with tf.GradientTape() as tape:
+            tape.watch(x_adv)
+            logits = model(x_adv, training=False)
+            loss = tf.reduce_mean(loss_fn(y, logits))
+        grad = tape.gradient(loss, x_adv)
+        x_adv = x_adv + alpha * tf.sign(grad)
+        x_adv = tf.clip_by_value(x_adv, x - eps, x + eps)
+        x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+    return x_adv
+
+@tf.function
+def cw_l2_attack_batch(
+    model, x, y,
+    steps=10,          # FAST
+    alpha=0.02,        # step size in L2 space
+    eps_l2=1.5,        # L2 budget per image (tune)
+    clip_min=0.0,
+    clip_max=1.0,
+    eps_linf=None      # optional: also enforce Linf (e.g., CFG.eps)
+):
+    """
+    Fast untargeted L2 attack (PGD-L2 style).
+    Much faster than true C&W but captures L2-type perturbations.
+    """
+    x = tf.cast(x, tf.float32)
+    y = tf.cast(y, tf.int32)
+
+    # random L2 init inside eps_l2 ball
+    r = tf.random.normal(tf.shape(x))
+    r_flat = tf.reshape(r, [tf.shape(x)[0], -1])
+    r_norm = tf.norm(r_flat, ord=2, axis=1, keepdims=True) + 1e-12
+    r_unit = r_flat / r_norm
+    rad = tf.random.uniform([tf.shape(x)[0], 1], 0.0, eps_l2)
+    r = tf.reshape(r_unit * rad, tf.shape(x))
+
+    x_adv = tf.clip_by_value(x + r, clip_min, clip_max)
+
+    for _ in tf.range(tf.cast(steps, tf.int32)):
+        with tf.GradientTape() as tape:
+            tape.watch(x_adv)
+            logits = model(x_adv, training=False)
+            loss = tf.reduce_mean(loss_fn(y, logits))
+        grad = tape.gradient(loss, x_adv)
+
+        # L2-normalized gradient step
+        g_flat = tf.reshape(grad, [tf.shape(x)[0], -1])
+        g_norm = tf.norm(g_flat, ord=2, axis=1, keepdims=True) + 1e-12
+        g_unit = g_flat / g_norm
+        g_unit = tf.reshape(g_unit, tf.shape(x))
+
+        x_adv = x_adv + alpha * g_unit
+
+        # project back to L2 ball around x
+        d = x_adv - x
+        d_flat = tf.reshape(d, [tf.shape(x)[0], -1])
+        d_norm = tf.norm(d_flat, ord=2, axis=1, keepdims=True) + 1e-12
+        factor = tf.minimum(1.0, eps_l2 / d_norm)
+        d = tf.reshape(d_flat * factor, tf.shape(x))
+        x_adv = x + d
+
+        # optional Linf clamp too
+        if eps_linf is not None:
+            x_adv = tf.clip_by_value(x_adv, x - eps_linf, x + eps_linf)
+
+        x_adv = tf.clip_by_value(x_adv, clip_min, clip_max)
+
+    return x_adv
+
+def make_adv_batch(x, y, attack_name):
+    eps = tf.constant(CFG.eps, tf.float32)
+
+    if attack_name == "fgsm":
+        return fgsm_attack(clf, x, y, eps)
+
+    elif attack_name == "pgd":
+        return pgd_attack(
+            clf, x, y,
+            eps,
+            tf.constant(CFG.pgd_steps, tf.int32),
+            tf.constant(CFG.pgd_alpha, tf.float32),
+        )
+
+    elif attack_name == "cw":
+        cw_steps  = getattr(CFG, "cw_steps", 10)
+        cw_alpha  = getattr(CFG, "cw_alpha", 0.02)
+        cw_eps_l2 = getattr(CFG, "cw_eps_l2", 1.5)
+
+        # optional: also enforce Linf=CFG.eps (or set None for pure L2)
+        eps_linf = getattr(CFG, "cw_eps_linf", None)
+
+        return cw_l2_attack_batch(
+            clf, x, y,
+            steps=cw_steps,
+            alpha=cw_alpha,
+            eps_l2=cw_eps_l2,
+            clip_min=0.0, clip_max=1.0,
+            eps_linf=eps_linf
+        )
+
+    else:
+        raise ValueError("attack_name must be 'fgsm', 'pgd', or 'cw'")
