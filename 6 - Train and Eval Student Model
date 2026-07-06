@@ -1,0 +1,119 @@
+# =========================
+# CELL 8 — Student model (adv-only): D_adv(x_adv) -> delta in [-eps, eps]
+# =========================
+def conv_block_simple(x, f):
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def build_delta_student():
+    inp = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
+
+    c1 = conv_block_simple(inp, 64);  p1 = layers.MaxPool2D()(c1)
+    c2 = conv_block_simple(p1, 128); p2 = layers.MaxPool2D()(c2)
+    b  = conv_block_simple(p2, 256)
+
+    u2 = layers.UpSampling2D()(b);   u2 = layers.Concatenate()([u2, c2])
+    c3 = conv_block_simple(u2, 128)
+
+    u1 = layers.UpSampling2D()(c3);  u1 = layers.Concatenate()([u1, c1])
+    c4 = conv_block_simple(u1, 64)
+
+    out = layers.Conv2D(3, 1, padding="same")(c4)
+    out = layers.Activation("tanh")(out)
+    out = layers.Lambda(lambda t: t * CFG.eps, name="delta_hat")(out)
+    return keras.Model(inp, out, name="delta_student_adv_only")
+
+D_adv = build_delta_student()
+optS = keras.optimizers.Adam(CFG.lr_student)
+D_adv.summary()
+# =========================
+# CELL 9 — Student training (teacher-supervised + consistency) — ALWAYS RETRAIN
+# =========================
+import os
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+
+@tf.function
+def student_losses(x_clean, x_adv):
+    # teacher label
+    delta_t = tf.stop_gradient(D([x_clean, x_adv], training=False))
+    # student predicts from x_adv only
+    delta_s = D_adv(x_adv, training=True)
+
+    # (1) match teacher delta
+    loss_delta = tf.reduce_mean(tf.square(delta_s - delta_t))
+
+    # (2) train-time reconstruction of x_adv (uses x_clean only in training)
+    x_adv_hat = tf.clip_by_value(x_clean + delta_s, 0.0, 1.0)
+    loss_adv = tf.reduce_mean(tf.square(x_adv - x_adv_hat))
+
+    # (3) self-consistency: after removing predicted delta, residual should be small
+    x_pur = tf.clip_by_value(x_adv - delta_s, 0.0, 1.0)
+    delta_resid = D_adv(x_pur, training=True)
+    loss_cons = tf.reduce_mean(tf.square(delta_resid))
+
+    # light regularizer
+    loss_l1 = tf.reduce_mean(tf.abs(delta_s))
+
+    total = (1.0 * loss_delta) + (0.5 * loss_adv) + (0.5 * loss_cons) + (0.001 * loss_l1)
+    return total, loss_delta, loss_adv, loss_cons, loss_l1
+
+# --- train step (NO @tf.function so C&W can run) ---
+def train_step_student(x_clean, y):
+    bs = tf.shape(x_clean)[0]
+
+    third = bs // 3
+    two_third = 2 * third
+
+    x1, y1 = x_clean[:third],      y[:third]
+    x2, y2 = x_clean[third:two_third], y[third:two_third]
+    x3, y3 = x_clean[two_third:],  y[two_third:]
+
+    x_adv1 = make_adv_batch(x1, y1, "fgsm")
+    x_adv2 = make_adv_batch(x2, y2, "pgd")
+    x_adv3 = make_adv_batch(x3, y3, "cw")
+
+    x_adv = tf.concat([x_adv1, x_adv2, x_adv3], axis=0)
+
+    with tf.GradientTape() as tape:
+        total, l_del, l_adv, l_cons, l1 = student_losses(x_clean, x_adv)
+
+    grads = tape.gradient(total, D_adv.trainable_variables)
+    optS.apply_gradients(zip(grads, D_adv.trainable_variables))
+    return total, l_del, l_adv, l_cons, l1
+
+
+# =========================
+# ALWAYS RETRAIN (ignore / delete any saved checkpoint)
+# =========================
+
+# Optional but recommended: delete old checkpoint to avoid accidental load later
+if os.path.exists(CFG.student_path):
+    try:
+        os.remove(CFG.student_path)
+        print("Deleted old student checkpoint:", CFG.student_path)
+    except Exception as e:
+        print("Could not delete old student checkpoint (continuing anyway):", e)
+
+# IMPORTANT:
+# This cell assumes D_adv and optS already exist (built earlier).
+# If you want a fresh-from-scratch student, rebuild D_adv + optS BEFORE this loop.
+
+for epoch in range(1, CFG.student_epochs + 1):
+    tr = []
+    for xb, yb in tqdm(train_ds, desc=f"Student Train {epoch}/{CFG.student_epochs}"):
+        out = train_step_student(xb, yb)
+        tr.append([float(x) for x in out])
+    tr = np.mean(tr, axis=0)
+
+    print(f"Epoch {epoch:02d} | total={tr[0]:.4f} delta={tr[1]:.4f} adv={tr[2]:.4f} cons={tr[3]:.4f} l1={tr[4]:.4f}")
+
+# save at end
+D_adv.save(CFG.student_path)
+print("Saved student:", CFG.student_path)
