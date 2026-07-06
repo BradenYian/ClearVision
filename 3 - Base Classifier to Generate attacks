@@ -1,0 +1,60 @@
+import os
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.applications import EfficientNetV2S
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+from tqdm.keras import TqdmCallback
+
+# ---- Keras-serializable preprocess layer (Keras 3 safe) ----
+@keras.utils.register_keras_serializable(package="custom")
+class EffNetV2Preprocess(layers.Layer):
+    def call(self, inputs):
+        inputs = tf.cast(inputs, tf.float32)
+        # IMPORTANT: your pipeline provides [0,1] (because you divided by 255 earlier),
+        # but preprocess_input expects [0,255]. So convert here:
+        return preprocess_input(inputs * 255.0)
+
+    def get_config(self):
+        return super().get_config()
+
+def build_classifier_efficientnetv2(
+    input_size=224,
+    dropout=0.3,
+    wd=1e-4,
+    weights="imagenet",
+    freeze_backbone=True
+):
+    inp = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="image")
+
+    x = layers.Resizing(input_size, input_size, name="resize")(inp)
+    x = EffNetV2Preprocess(name="effnetv2_preprocess")(x)
+
+    backbone = EfficientNetV2S(
+        include_top=False,
+        weights=weights,
+        input_shape=(input_size, input_size, 3),
+        pooling="avg",
+    )
+    backbone.trainable = not freeze_backbone
+
+    # BN stability when frozen
+    feats = backbone(x, training=False if freeze_backbone else True)
+
+    h = layers.Dense(
+        256, activation="relu",
+        kernel_regularizer=keras.regularizers.l2(wd),
+        name="head_dense",
+    )(feats)
+    h = layers.Dropout(dropout, name="head_dropout")(h)
+    out = layers.Dense(CFG.num_classes, name="logits")(h)
+
+    model = keras.Model(inp, out, name="effnetv2s_classifier")
+    return model, backbone
+
+def compile_classifier(m, lr=1e-3):
+    m.compile(
+        optimizer=keras.optimizers.Adam(lr),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
