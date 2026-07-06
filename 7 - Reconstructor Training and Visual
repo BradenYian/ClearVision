@@ -1,0 +1,106 @@
+from tensorflow import keras
+from tensorflow.keras import layers
+import tensorflow as tf
+
+def recon_block(x, f):
+    x = layers.Conv2D(f, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def build_reconstructor():
+    x_adv_in = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
+    d_in     = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="delta_hat")
+
+    # helpful extra: naive cleaned guess
+    x_naive = layers.Subtract()([x_adv_in, d_in])
+
+    inp = layers.Concatenate()([x_adv_in, d_in, x_naive])
+
+    c1 = recon_block(inp, 64);  p1 = layers.MaxPool2D()(c1)
+    c2 = recon_block(p1, 128);  p2 = layers.MaxPool2D()(c2)
+    b  = recon_block(p2, 256)
+
+    u2 = layers.UpSampling2D()(b);  u2 = layers.Concatenate()([u2, c2])
+    c3 = recon_block(u2, 128)
+
+    u1 = layers.UpSampling2D()(c3); u1 = layers.Concatenate()([u1, c1])
+    c4 = recon_block(u1, 64)
+
+    out = layers.Conv2D(3, 1, padding="same", activation="sigmoid")(c4)
+    return keras.Model([x_adv_in, d_in], out, name="attack_remover_R")
+
+R = build_reconstructor()
+optR = keras.optimizers.Adam(2e-4)
+R.summary()
+@tf.function
+def train_step_R(x_clean, y):
+    # build mixed FGSM/PGD adversarial batch
+    bs = tf.shape(x_clean)[0]
+    half = bs // 2
+    x1, y1 = x_clean[:half], y[:half]
+    x2, y2 = x_clean[half:], y[half:]
+
+    x_adv1 = make_adv_batch(x1, y1, "fgsm")
+    x_adv2 = make_adv_batch(x2, y2, "pgd")
+    x_adv  = tf.concat([x_adv1, x_adv2], axis=0)
+
+    # predicted perturbation from adv-only student
+    delta_hat = tf.stop_gradient(D_adv(x_adv, training=False))
+
+    with tf.GradientTape() as tape:
+        x_clean_hat = R([x_adv, delta_hat], training=True)
+
+        # pixel loss (L1 tends to preserve edges better than L2)
+        loss_pix = tf.reduce_mean(tf.abs(x_clean_hat - x_clean))
+
+        # optional: classifier consistency (helps preserve semantics)
+        logits = clf(x_clean_hat, training=False)
+        loss_cls = tf.reduce_mean(loss_fn(y, logits))
+
+        total = loss_pix + 0.1 * loss_cls
+
+    grads = tape.gradient(total, R.trainable_variables)
+    optR.apply_gradients(zip(grads, R.trainable_variables))
+    return total, loss_pix, loss_cls
+R_epochs = 20  # start small
+for epoch in range(1, R_epochs + 1):
+    tr = []
+    for xb, yb in tqdm(train_ds, desc=f"R Train {epoch}/{R_epochs}"):
+        total, lpix, lcls = train_step_R(xb, yb)
+        tr.append([float(total), float(lpix), float(lcls)])
+    tr = np.mean(tr, axis=0)
+    print(f"Epoch {epoch:02d} | total={tr[0]:.4f} pix={tr[1]:.4f} cls={tr[2]:.4f}")
+# pick one
+for xb, yb in test_ds.take(1):
+    x_clean = xb[:1]
+    y = yb[:1]
+    break
+
+x_adv_sq = square_attack_single(clf, x_clean, y, eps=CFG.eps, steps=400, p_init=0.8)
+
+# attack-only pipeline
+delta_hat = D_adv(x_adv_sq, training=False)
+x_hat = R([x_adv_sq, delta_hat], training=False)
+
+pred_clean = int(tf.argmax(clf(x_clean, training=False), axis=1).numpy()[0])
+pred_adv   = int(tf.argmax(clf(x_adv_sq, training=False), axis=1).numpy()[0])
+pred_hat   = int(tf.argmax(clf(x_hat, training=False), axis=1).numpy()[0])
+
+print("y true:", int(y.numpy()[0]))
+print("pred clean:", pred_clean)
+print("pred adv  :", pred_adv)
+print("pred recon:", pred_hat)
+print("MAE(recon vs clean):", float(tf.reduce_mean(tf.abs(x_hat - x_clean))))
+
+# visualize
+x0 = tf.squeeze(x_clean).numpy()
+xa = tf.squeeze(x_adv_sq).numpy()
+xh = tf.squeeze(x_hat).numpy()
+
+plt.figure(figsize=(9,3))
+plt.subplot(1,3,1); plt.imshow(x0); plt.title("clean"); plt.axis("off")
+plt.subplot(1,3,2); plt.imshow(xa); plt.title("Square x_adv"); plt.axis("off")
+plt.subplot(1,3,3); plt.imshow(xh); plt.title("R(x_adv, δ̂)"); plt.axis("off")
+plt.tight_layout()
+plt.show()
