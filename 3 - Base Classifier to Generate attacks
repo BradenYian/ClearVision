@@ -58,3 +58,65 @@ def compile_classifier(m, lr=1e-3):
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"],
     )
+
+# --- quick sanity check: make sure labels/ranges look right ---
+xb, yb = next(iter(train_ds))
+print("sanity x range:", float(tf.reduce_min(xb)), float(tf.reduce_max(xb)))  # should be ~0..1
+print("sanity y shape/dtype:", yb.shape, yb.dtype)
+print("sanity y min/max:", int(tf.reduce_min(yb)), int(tf.reduce_max(yb)))   # should be 0..9
+
+# --- Try to load saved model first ---
+clf = None
+if hasattr(CFG, "clf_path") and CFG.clf_path and os.path.exists(CFG.clf_path):
+    try:
+        clf = keras.models.load_model(CFG.clf_path)
+        print("Loaded saved classifier:", CFG.clf_path)
+    except Exception as e:
+        print("Failed to load saved classifier. Will retrain. Error:", repr(e))
+        clf = None
+else:
+    print("No saved classifier found at:", getattr(CFG, "clf_path", None))
+
+# --- If not loaded, train and save ---
+if clf is None:
+    clf, backbone = build_classifier_efficientnetv2(
+        input_size=224,
+        dropout=0.3,
+        wd=1e-4,
+        weights="imagenet",
+        freeze_backbone=True,
+    )
+    compile_classifier(clf, lr=1e-3)
+
+    clf.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=CFG.clf_epochs,
+        callbacks=[TqdmCallback(verbose=1)],
+        verbose=0,
+    )
+
+    # Optional fine-tuning
+    if getattr(CFG, "clf_finetune_epochs", 0) and CFG.clf_finetune_epochs > 0:
+        backbone.trainable = True
+        compile_classifier(clf, lr=1e-4)
+        clf.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=CFG.clf_epochs + CFG.clf_finetune_epochs,
+            initial_epoch=CFG.clf_epochs,
+            callbacks=[TqdmCallback(verbose=1)],
+            verbose=0,
+        )
+
+    clf.save(CFG.clf_path)
+    print("Saved classifier:", CFG.clf_path)
+
+# Ensure model is compiled
+try:
+    compile_classifier(clf, lr=1e-3)
+except Exception:
+    pass
+
+test_acc = clf.evaluate(test_ds, verbose=0)[1]
+print("Classifier test acc:", test_acc)
