@@ -1,0 +1,67 @@
+import numpy as np
+import tensorflow as tf
+
+def eval_pipeline_on_attack(attack_name, max_batches=None):
+    clean_accs, adv_accs, rec_accs = [], [], []
+    delta_maes, rec_maes, rec_psnrs = [], [], []
+
+    b = 0
+    for xb, yb in test_ds:
+        # 1) make adversarial
+        x_adv = make_adv_batch(xb, yb, attack_name)
+
+        # 2) predict attack (delta) from adv-only student
+        delta_hat = D_adv(x_adv, training=False)
+
+        # 3) reconstruct clean using reconstructor (attack-only inputs)
+        x_rec = R([x_adv, delta_hat], training=False)
+        x_rec = tf.clip_by_value(x_rec, 0.0, 1.0)
+
+        # ---- metrics ----
+        # classifier preds
+        pred_clean = tf.argmax(clf(xb, training=False), axis=1, output_type=tf.int32)
+        pred_adv   = tf.argmax(clf(x_adv, training=False), axis=1, output_type=tf.int32)
+        pred_rec   = tf.argmax(clf(x_rec, training=False), axis=1, output_type=tf.int32)
+
+        clean_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_clean, yb), tf.float32)))
+        adv_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_adv, yb), tf.float32)))
+        rec_accs.append(tf.reduce_mean(tf.cast(tf.equal(pred_rec, yb), tf.float32)))
+
+        # delta quality (needs clean only for eval)
+        delta_true = x_adv - xb
+        delta_maes.append(tf.reduce_mean(tf.abs(delta_true - delta_hat)))
+
+        # reconstruction quality
+        rec_maes.append(tf.reduce_mean(tf.abs(x_rec - xb)))
+        rec_psnrs.append(tf.reduce_mean(tf.image.psnr(xb, x_rec, max_val=1.0)))
+
+        b += 1
+        if max_batches is not None and b >= max_batches:
+            break
+
+    print(f"\n[PIPELINE eval on {attack_name.upper()}]")
+    print(" clean_acc:", float(tf.reduce_mean(clean_accs)))
+    print("   adv_acc:", float(tf.reduce_mean(adv_accs)))
+    print("   rec_acc:", float(tf.reduce_mean(rec_accs)))
+    print(" delta_MAE (true vs hat):", float(tf.reduce_mean(delta_maes)))
+    print(" recon_MAE (rec vs clean):", float(tf.reduce_mean(rec_maes)))
+    print(" PSNR(rec vs clean):", float(tf.reduce_mean(rec_psnrs)))
+
+# Run on FGSM and PGD (fast, batched)
+eval_pipeline_on_attack("fgsm")
+eval_pipeline_on_attack("pgd")
+import os
+
+os.makedirs(CFG.out_dir, exist_ok=True)
+
+BASE_PATH = os.path.join(CFG.out_dir, "base_classifier.keras")
+PRED_PATH = os.path.join(CFG.out_dir, "attack_predictor_D_adv.keras")
+REC_PATH  = os.path.join(CFG.out_dir, "reconstructor_R.keras")
+
+clf.save(BASE_PATH)
+D_adv.save(PRED_PATH)
+R.save(REC_PATH)
+
+print("Saved base classifier  ->", BASE_PATH)
+print("Saved attack predictor ->", PRED_PATH)
+print("Saved reconstructor    ->", REC_PATH)
