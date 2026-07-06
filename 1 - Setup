@@ -1,0 +1,65 @@
+!pip -q install tqdm
+
+import os, random, math
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+
+print("TF:", tf.__version__)
+print("GPU:", tf.config.list_physical_devices("GPU"))
+
+
+import os, random
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+SEED = 1337
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+class CFG:
+    img_h, img_w, img_c = 32, 32, 3
+    num_classes = 10
+
+    train_size = 40000
+    val_size   = 5000
+    test_size  = 5000
+
+    batch_size = 128
+    clf_epochs = 10
+
+    # ONE eps for everything (model "knows" the strength)
+    eps = 0.1
+    fgsm_eps = eps
+    pgd_eps  = eps
+
+    pgd_steps = 10
+    pgd_alpha = 2/255.0
+
+    # paired delta model (teacher)
+    delta_epochs = 2
+    lr_delta = 2e-4
+
+    # adv-only student (defense attempt)
+    student_epochs = 2
+    lr_student = 2e-4
+
+    out_dir = "attack_delta_outputs"
+    os.makedirs(out_dir, exist_ok=True)
+    clf_path     = os.path.join(out_dir, "cifar10_clf.keras")
+    delta_path   = os.path.join(out_dir, "delta_predictor_teacher.keras")     # teacher (paired)
+    student_path = os.path.join(out_dir, "delta_student_adv_only.keras")      # student (adv-only)
+CFG.cw_steps = 10
+CFG.cw_alpha = 0.02
+CFG.cw_eps_l2 = 1.5
+CFG.cw_eps_linf = CFG.eps   # optional; set None if you want pure L2
+
+print("Config ready.")
