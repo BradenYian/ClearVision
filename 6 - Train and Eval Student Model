@@ -1,119 +1,476 @@
 # =========================
-# CELL 8 — Student model (adv-only): D_adv(x_adv) -> delta in [-eps, eps]
+#STUDENT TRAINING WITH TIME-BASED ROLLING CHECKPOINTS
 # =========================
-def conv_block_simple(x, f):
-    x = layers.Conv2D(f, 3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
-    x = layers.Conv2D(f, 3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu")(x)
-    return x
 
-def build_delta_student():
-    inp = keras.Input(shape=(CFG.img_h, CFG.img_w, CFG.img_c), name="x_adv")
-
-    c1 = conv_block_simple(inp, 64);  p1 = layers.MaxPool2D()(c1)
-    c2 = conv_block_simple(p1, 128); p2 = layers.MaxPool2D()(c2)
-    b  = conv_block_simple(p2, 256)
-
-    u2 = layers.UpSampling2D()(b);   u2 = layers.Concatenate()([u2, c2])
-    c3 = conv_block_simple(u2, 128)
-
-    u1 = layers.UpSampling2D()(c3);  u1 = layers.Concatenate()([u1, c1])
-    c4 = conv_block_simple(u1, 64)
-
-    out = layers.Conv2D(3, 1, padding="same")(c4)
-    out = layers.Activation("tanh")(out)
-    out = layers.Lambda(lambda t: t * CFG.eps, name="delta_hat")(out)
-    return keras.Model(inp, out, name="delta_student_adv_only")
-
-D_adv = build_delta_student()
-optS = keras.optimizers.Adam(CFG.lr_student)
-D_adv.summary()
-# =========================
-# CELL 9 — Student training (teacher-supervised + consistency) — ALWAYS RETRAIN
-# =========================
 import os
+import time
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 
-@tf.function
-def student_losses(x_clean, x_adv):
-    # teacher label
-    delta_t = tf.stop_gradient(D([x_clean, x_adv], training=False))
-    # student predicts from x_adv only
-    delta_s = D_adv(x_adv, training=True)
 
-    # (1) match teacher delta
-    loss_delta = tf.reduce_mean(tf.square(delta_s - delta_t))
+# ---------------------------------------------------------
+# CHECKPOINT SETTINGS
+# ---------------------------------------------------------
 
-    # (2) train-time reconstruction of x_adv (uses x_clean only in training)
-    x_adv_hat = tf.clip_by_value(x_clean + delta_s, 0.0, 1.0)
-    loss_adv = tf.reduce_mean(tf.square(x_adv - x_adv_hat))
+# Save approximately every 120,000 ms = 2 minutes.
+CFG.student_checkpoint_every_ms = 120_000
 
-    # (3) self-consistency: after removing predicted delta, residual should be small
-    x_pur = tf.clip_by_value(x_adv - delta_s, 0.0, 1.0)
-    delta_resid = D_adv(x_pur, training=True)
-    loss_cons = tf.reduce_mean(tf.square(delta_resid))
+# Retain only the newest three checkpoints.
+CFG.max_student_checkpoints = 3
 
-    # light regularizer
-    loss_l1 = tf.reduce_mean(tf.abs(delta_s))
-
-    total = (1.0 * loss_delta) + (0.5 * loss_adv) + (0.5 * loss_cons) + (0.001 * loss_l1)
-    return total, loss_delta, loss_adv, loss_cons, loss_l1
-
-# --- train step (NO @tf.function so C&W can run) ---
-def train_step_student(x_clean, y):
-    bs = tf.shape(x_clean)[0]
-
-    third = bs // 3
-    two_third = 2 * third
-
-    x1, y1 = x_clean[:third],      y[:third]
-    x2, y2 = x_clean[third:two_third], y[third:two_third]
-    x3, y3 = x_clean[two_third:],  y[two_third:]
-
-    x_adv1 = make_adv_batch(x1, y1, "fgsm")
-    x_adv2 = make_adv_batch(x2, y2, "pgd")
-    x_adv3 = make_adv_batch(x3, y3, "cw")
-
-    x_adv = tf.concat([x_adv1, x_adv2, x_adv3], axis=0)
-
-    with tf.GradientTape() as tape:
-        total, l_del, l_adv, l_cons, l1 = student_losses(x_clean, x_adv)
-
-    grads = tape.gradient(total, D_adv.trainable_variables)
-    optS.apply_gradients(zip(grads, D_adv.trainable_variables))
-    return total, l_del, l_adv, l_cons, l1
+# Training checkpoints are separate from the final .keras model.
+CFG.student_checkpoint_dir = "./delta_student_checkpoints"
 
 
-# =========================
-# ALWAYS RETRAIN (ignore / delete any saved checkpoint)
-# =========================
+STUDENT_CHECKPOINT_EVERY_MS = getattr(
+    CFG,
+    "student_checkpoint_every_ms",
+    5 * 60 * 1000,
+)
 
-# Optional but recommended: delete old checkpoint to avoid accidental load later
-if os.path.exists(CFG.student_path):
+MAX_STUDENT_CHECKPOINTS = getattr(
+    CFG,
+    "max_student_checkpoints",
+    3,
+)
+
+STUDENT_CHECKPOINT_DIR = getattr(
+    CFG,
+    "student_checkpoint_dir",
+    os.path.splitext(CFG.student_path)[0] + "_checkpoints",
+)
+
+
+# Change this to True only when you intentionally want to discard
+# all saved student training progress.
+FORCE_FRESH_STUDENT = False
+
+
+if STUDENT_CHECKPOINT_EVERY_MS <= 0:
+    raise ValueError(
+        "STUDENT_CHECKPOINT_EVERY_MS must be greater than zero."
+    )
+
+if MAX_STUDENT_CHECKPOINTS <= 0:
+    raise ValueError(
+        "MAX_STUDENT_CHECKPOINTS must be greater than zero."
+    )
+
+
+# ---------------------------------------------------------
+# OPTIONAL RESET
+# ---------------------------------------------------------
+
+if FORCE_FRESH_STUDENT and tf.io.gfile.exists(STUDENT_CHECKPOINT_DIR):
+    tf.io.gfile.rmtree(STUDENT_CHECKPOINT_DIR)
+    print(
+        "Deleted existing student training checkpoints:",
+        STUDENT_CHECKPOINT_DIR,
+    )
+
+tf.io.gfile.makedirs(STUDENT_CHECKPOINT_DIR)
+
+
+# ---------------------------------------------------------
+# CHECKPOINTED TRAINING STATE
+# ---------------------------------------------------------
+
+# Current epoch, using the same 1-based numbering as the training loop.
+student_checkpoint_epoch = tf.Variable(
+    1,
+    dtype=tf.int64,
+    trainable=False,
+    name="student_checkpoint_epoch",
+)
+
+# Number of successfully completed batches in the current epoch.
+student_checkpoint_batch = tf.Variable(
+    0,
+    dtype=tf.int64,
+    trainable=False,
+    name="student_checkpoint_batch",
+)
+
+# Total number of successfully completed student training batches.
+student_global_step = tf.Variable(
+    0,
+    dtype=tf.int64,
+    trainable=False,
+    name="student_global_step",
+)
+
+
+# Running epoch metrics:
+# [
+#     total,
+#     loss_delta,
+#     loss_adv,
+#     loss_cons,
+#     loss_l1,
+# ]
+#
+# Saving these means the printed epoch average remains correct after
+# resuming in the middle of an epoch.
+student_metric_sum = tf.Variable(
+    tf.zeros([5], dtype=tf.float32),
+    trainable=False,
+    name="student_metric_sum",
+)
+
+student_metric_count = tf.Variable(
+    0,
+    dtype=tf.int64,
+    trainable=False,
+    name="student_metric_count",
+)
+
+
+# ---------------------------------------------------------
+# CREATE CHECKPOINT
+# ---------------------------------------------------------
+
+# This checkpoint contains:
+#   - D_adv model weights
+#   - Adam optimizer state
+#   - current epoch
+#   - current batch position
+#   - global step
+#   - running epoch metrics
+student_checkpoint = tf.train.Checkpoint(
+    model=D_adv,
+    optimizer=optS,
+    epoch=student_checkpoint_epoch,
+    batch_in_epoch=student_checkpoint_batch,
+    global_step=student_global_step,
+    metric_sum=student_metric_sum,
+    metric_count=student_metric_count,
+)
+
+student_checkpoint_manager = tf.train.CheckpointManager(
+    checkpoint=student_checkpoint,
+    directory=STUDENT_CHECKPOINT_DIR,
+    max_to_keep=MAX_STUDENT_CHECKPOINTS,
+    checkpoint_name="delta_student",
+)
+
+
+# ---------------------------------------------------------
+# RESTORE LATEST CHECKPOINT
+# ---------------------------------------------------------
+
+if student_checkpoint_manager.latest_checkpoint:
+    restore_status = student_checkpoint.restore(
+        student_checkpoint_manager.latest_checkpoint
+    )
+
+    # Adam's slot variables might not exist until the first optimizer
+    # update. TensorFlow will restore them when they are created.
+    restore_status.expect_partial()
+
+    print("Restored student checkpoint:")
+    print(" ", student_checkpoint_manager.latest_checkpoint)
+    print(
+        "  Resume epoch:",
+        int(student_checkpoint_epoch.numpy()),
+    )
+    print(
+        "  Resume batch:",
+        int(student_checkpoint_batch.numpy()),
+    )
+    print(
+        "  Global step:",
+        int(student_global_step.numpy()),
+    )
+    print(
+        "  Saved metric batches:",
+        int(student_metric_count.numpy()),
+    )
+else:
+    print("No student checkpoint found. Starting from scratch.")
+
+
+# ---------------------------------------------------------
+# CHECKPOINT SAVE FUNCTION
+# ---------------------------------------------------------
+
+def save_student_checkpoint(reason):
+    """
+    Save the student model, Adam optimizer, training position,
+    and running metric state.
+    """
+
+    checkpoint_path = student_checkpoint_manager.save()
+
+    print(
+        f"\nStudent checkpoint saved ({reason}):"
+        f"\n  path={checkpoint_path}"
+        f"\n  epoch={int(student_checkpoint_epoch.numpy())}"
+        f"\n  batch={int(student_checkpoint_batch.numpy())}"
+        f"\n  global_step={int(student_global_step.numpy())}"
+    )
+
+    return checkpoint_path
+
+
+# ---------------------------------------------------------
+# OPTIONAL SANITY CHECK
+# ---------------------------------------------------------
+
+xb, yb = next(iter(train_ds))
+
+print("\nStudent checkpoint configuration:")
+print(
+    "  Save interval:",
+    STUDENT_CHECKPOINT_EVERY_MS,
+    "ms",
+)
+print(
+    "  Maximum retained checkpoints:",
+    MAX_STUDENT_CHECKPOINTS,
+)
+print(
+    "  Checkpoint directory:",
+    STUDENT_CHECKPOINT_DIR,
+)
+print(
+    "  Example clean batch shape:",
+    xb.shape,
+)
+
+
+# The training function divides each batch into FGSM, PGD, and C&W
+# sections. A batch therefore needs at least three examples.
+example_batch_size = int(tf.shape(xb)[0].numpy())
+
+if example_batch_size < 3:
+    raise ValueError(
+        "Student training batches must contain at least three examples "
+        "because train_step_student splits each batch into FGSM, PGD, "
+        "and C&W sections."
+    )
+
+
+# ---------------------------------------------------------
+# TRAINING SETUP
+# ---------------------------------------------------------
+
+start_epoch = int(student_checkpoint_epoch.numpy())
+resume_batch = int(student_checkpoint_batch.numpy())
+
+checkpoint_interval_ns = (
+    int(STUDENT_CHECKPOINT_EVERY_MS) * 1_000_000
+)
+
+# monotonic_ns() is unaffected by changes to the system clock.
+next_checkpoint_time = (
+    time.monotonic_ns() + checkpoint_interval_ns
+)
+
+
+# ---------------------------------------------------------
+# STUDENT TRAINING LOOP
+# ---------------------------------------------------------
+
+try:
+    for epoch in range(
+        start_epoch,
+        CFG.student_epochs + 1,
+    ):
+        # Only the first restored epoch can have completed batches.
+        first_batch = (
+            resume_batch
+            if epoch == start_epoch
+            else 0
+        )
+
+        if first_batch > 0:
+            print(
+                f"\nResuming student epoch {epoch} "
+                f"after batch {first_batch}."
+            )
+
+            # Skip batches whose completed state is already represented
+            # by the restored model and optimizer.
+            epoch_train_ds = train_ds.skip(first_batch)
+        else:
+            epoch_train_ds = train_ds
+
+        progress = tqdm(
+            enumerate(
+                epoch_train_ds,
+                start=first_batch,
+            ),
+            desc=(
+                f"Student Train "
+                f"{epoch}/{CFG.student_epochs}"
+            ),
+        )
+
+        for batch_index, (xb, yb) in progress:
+            current_batch_size = int(
+                tf.shape(xb)[0].numpy()
+            )
+
+            if current_batch_size < 3:
+                raise ValueError(
+                    "Encountered a training batch containing fewer "
+                    "than three examples. Use drop_remainder=True or "
+                    "increase the dataset batch size."
+                )
+
+            # Perform one complete student optimizer update.
+            output = train_step_student(xb, yb)
+
+            batch_metrics = tf.stack(
+                [
+                    tf.cast(value, tf.float32)
+                    for value in output
+                ]
+            )
+
+            total = batch_metrics[0]
+            loss_delta = batch_metrics[1]
+            loss_adv = batch_metrics[2]
+            loss_cons = batch_metrics[3]
+            loss_l1 = batch_metrics[4]
+
+            # Record metrics only after the optimizer update succeeds.
+            student_metric_sum.assign_add(batch_metrics)
+            student_metric_count.assign_add(1)
+
+            # Record the exact completed training position.
+            student_checkpoint_epoch.assign(epoch)
+            student_checkpoint_batch.assign(batch_index + 1)
+            student_global_step.assign_add(1)
+
+            progress.set_postfix(
+                total=f"{float(total):.4f}",
+                delta=f"{float(loss_delta):.4f}",
+                adv=f"{float(loss_adv):.4f}",
+                cons=f"{float(loss_cons):.4f}",
+                step=int(student_global_step.numpy()),
+            )
+
+            # Check the timer after a complete optimizer update.
+            now = time.monotonic_ns()
+
+            if now >= next_checkpoint_time:
+                save_student_checkpoint(
+                    reason=(
+                        f"{STUDENT_CHECKPOINT_EVERY_MS} "
+                        "ms interval"
+                    )
+                )
+
+                # Start the next interval after checkpoint writing
+                # finishes, avoiding repeated immediate saves.
+                next_checkpoint_time = (
+                    time.monotonic_ns()
+                    + checkpoint_interval_ns
+                )
+
+        # -------------------------------------------------
+        # END-OF-EPOCH METRICS
+        # -------------------------------------------------
+
+        completed_metric_batches = int(
+            student_metric_count.numpy()
+        )
+
+        if completed_metric_batches > 0:
+            epoch_metrics = (
+                student_metric_sum.numpy()
+                / completed_metric_batches
+            )
+        else:
+            epoch_metrics = np.full(
+                5,
+                np.nan,
+                dtype=np.float32,
+            )
+
+        print(
+            f"\nEpoch {epoch:02d}"
+            f" | total={epoch_metrics[0]:.4f}"
+            f" delta={epoch_metrics[1]:.4f}"
+            f" adv={epoch_metrics[2]:.4f}"
+            f" cons={epoch_metrics[3]:.4f}"
+            f" l1={epoch_metrics[4]:.4f}"
+        )
+
+        # Mark the epoch complete. A restart from the checkpoint
+        # created below begins at the next epoch.
+        student_checkpoint_epoch.assign(epoch + 1)
+        student_checkpoint_batch.assign(0)
+
+        # Reset metric accumulators for the next epoch.
+        student_metric_sum.assign(
+            tf.zeros([5], dtype=tf.float32)
+        )
+        student_metric_count.assign(0)
+
+        save_student_checkpoint(
+            reason=f"end of epoch {epoch}"
+        )
+
+        # Only the initially restored epoch can require skipping.
+        resume_batch = 0
+
+
+# ---------------------------------------------------------
+# INTERRUPTION HANDLING
+# ---------------------------------------------------------
+
+except KeyboardInterrupt:
     try:
-        os.remove(CFG.student_path)
-        print("Deleted old student checkpoint:", CFG.student_path)
-    except Exception as e:
-        print("Could not delete old student checkpoint (continuing anyway):", e)
+        save_student_checkpoint(
+            reason="manual interruption"
+        )
+        print(
+            "\nStudent training was interrupted. "
+            "The latest completed batch was checkpointed."
+        )
+    except Exception as checkpoint_error:
+        print(
+            "\nStudent training was interrupted, but the "
+            "emergency checkpoint failed:",
+            checkpoint_error,
+        )
 
-# IMPORTANT:
-# This cell assumes D_adv and optS already exist (built earlier).
-# If you want a fresh-from-scratch student, rebuild D_adv + optS BEFORE this loop.
+    raise
 
-for epoch in range(1, CFG.student_epochs + 1):
-    tr = []
-    for xb, yb in tqdm(train_ds, desc=f"Student Train {epoch}/{CFG.student_epochs}"):
-        out = train_step_student(xb, yb)
-        tr.append([float(x) for x in out])
-    tr = np.mean(tr, axis=0)
 
-    print(f"Epoch {epoch:02d} | total={tr[0]:.4f} delta={tr[1]:.4f} adv={tr[2]:.4f} cons={tr[3]:.4f} l1={tr[4]:.4f}")
+except Exception:
+    try:
+        save_student_checkpoint(
+            reason="training exception"
+        )
+        print(
+            "\nStudent training failed. The latest completed "
+            "batch was checkpointed."
+        )
+    except Exception as checkpoint_error:
+        print(
+            "\nStudent training failed, and the emergency "
+            "checkpoint also failed:",
+            checkpoint_error,
+        )
 
-# save at end
+    raise
+
+
+# ---------------------------------------------------------
+# FINAL STANDALONE EXPORT
+# ---------------------------------------------------------
+
+# This runs only after every requested student epoch completes.
+# Use the rolling checkpoint directory to resume training.
+# Use CFG.student_path for final inference/deployment.
 D_adv.save(CFG.student_path)
-print("Saved student:", CFG.student_path)
+
+print("\nSaved final student model:", CFG.student_path)
+print(
+    "Rolling student checkpoints are stored in:",
+    STUDENT_CHECKPOINT_DIR,
+)
