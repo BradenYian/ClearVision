@@ -23,5 +23,12 @@ Once installed, start Jupyter Lab as follows:
   
 3. Once Jupyter Notebook is open, all the files in that directory will appear in the files tab.
 
+<img width="1265" height="879" alt="Image" src="https://github.com/user-attachments/assets/79d70b6c-4756-4518-9e01-081b54ec5aa1" />
+
 5. If this is the first time running ClearVision from the current directory, the first step will be to run "0 - Setup & Run Website.jpynb". This will configure/setup and start ClearVision
-6. If ClearVision has already been setup and run once, then simply running "Website_Launch.jpynb" is all that is necessary to startup ClearVision.
+
+
+
+7. If ClearVision has already been setup and run once, then simply running "Website_Launch.jpynb" is all that is necessary to startup ClearVision.
+
+
