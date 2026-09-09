@@ -13,7 +13,9 @@ Once installed, start Jupyter Lab as follows:
 1. Open/Start Jupyter Notebook in the directory which contains the GitHub repository. 
 	a.) Navigate to the directory containing the ClearVision files with File Explorer Windows key + E (Win+E)
   b.)	Once in the repository directory, use the object menu (Right Clicking the mouse in the directory) and select "Open in Terminal". This will open a CMD window in the current directory.
-  <img width="898" height="862" alt="Image" src="https://github.com/user-attachments/assets/0d026f2a-7a49-4f99-8e11-233ff0b93c01" />
+
+<img width="898" height="862" alt="Image" src="https://github.com/user-attachments/assets/0d026f2a-7a49-4f99-8e11-233ff0b93c01" />
+  
   c.) Alternatively, open a command window and change directory within the command window to the ClearVision directory. i.e. cd c:\<repository path>
 2. Start Jupyter Lab by typing 'jupyter lab' in the command window just opened.
 3. Once Jupyter Notebook is open, all the files in that directory will appear in the files tab.
