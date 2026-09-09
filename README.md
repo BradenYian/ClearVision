@@ -18,6 +18,9 @@ Once installed, start Jupyter Lab as follows:
   
   c.) Alternatively, open a command window and change directory within the command window to the ClearVision directory. i.e. cd c:\<repository path>
 2. Start Jupyter Lab by typing 'jupyter lab' in the command window just opened.
+
+<img width="964" height="505" alt="Image" src="https://github.com/user-attachments/assets/e7aee961-1280-46ef-ab73-dc61045f9a4f" />
+  
 3. Once Jupyter Notebook is open, all the files in that directory will appear in the files tab.
 
 5. If this is the first time running ClearVision from the current directory, the first step will be to run "0 - Setup & Run Website.jpynb". This will configure/setup and start ClearVision
