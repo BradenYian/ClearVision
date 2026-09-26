@@ -1,54 +1,4 @@
-
-!pip -q install pyngrok > /dev/null
-!pip -q install streamlit > /dev/null
-!pip -q install patool > /dev/null
-
-
-import cv2
-import gdown
-import glob
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-import patoolib
-import streamlit as st
-
-from joblib import dump
-from tqdm import tqdm
-from pyngrok import ngrok
-
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-
-from keras.applications.vgg16 import VGG16
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, GlobalAveragePooling2D
-from keras.optimizers import SGD
-
-
-
-
-def launch_website():
-  print ("Click this link to try your web app:")
-  if (ngrok.get_tunnels() != None):
-    ngrok.kill()
-  tunnel = ngrok.connect()
-  print(tunnel.public_url)
-  !streamlit run --server.port 80 app.py > /dev/null
-!ngrok authtoken 30iO8wSjR6B6RzKjBmEu41rkG98_K1aCukdpugCxbTk1KB9R
-
-!gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
-!gdown 1cHmPkUzkHOorE5RYXWhyyBcKdLUaNWk9
-!gdown 1MPct9YvPv-cerTT9K7Oy1UfkFCg2Xh5K
-!gdown 1qH3KajXHUYQUEuPFM8S8KaPFt1i20eVe
-!gdown 14hZ20O8eUeWQy5loYlfzbyp4YG_fm1sD
-
-!cd /content
-!mv reconstructor_R.keras reconstructor.keras
-!ls -lh reconstructor*.keras
-%%writefile app.py
+%%writefile /content/app.py
 import streamlit as st
 import numpy as np
 import cv2
@@ -62,7 +12,6 @@ import io
 import keras
 from keras import layers
 from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
-
 
 @keras.utils.register_keras_serializable(package="custom")
 class EffNetV2Preprocess(layers.Layer):
@@ -105,9 +54,9 @@ def decode_image(uploaded_file):
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-def to_cifar(img_bgr):
-    img = cv2.resize(img_bgr, (32, 32), interpolation=cv2.INTER_AREA)
-    img = cv2.cvtColor(img_bgr if img_bgr.shape[:2] == (32, 32) else img, cv2.COLOR_BGR2RGB)
+def to_native(img_bgr):
+    # Preserve the uploaded image's original H x W. No resizing is performed.
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img = img.astype("float32") / 255.0
     return np.expand_dims(img, axis=0), img
 
@@ -276,10 +225,10 @@ def ss_init(name, value):
         st.session_state[name] = value
 
 ss_init("x_clean", None)
-ss_init("img32_clean", None)
+ss_init("img_clean", None)
 
 ss_init("x_adv", None)
-ss_init("img32_adv", None)
+ss_init("img_adv", None)
 ss_init("delta", None)
 ss_init("delta_hm", None)
 ss_init("x_rec", None)
@@ -369,11 +318,11 @@ def compute_mix_if_needed(x_adv: np.ndarray, x_rec: np.ndarray, norm_label: str,
 
 FORCED_IDX = 0
 
-def classify_with_base(x_img32: np.ndarray):
+def classify_with_base(x_img: np.ndarray):
     if clf is None:
         return None, None, None
 
-    x = np.expand_dims(x_img32, axis=0).astype(np.float32)
+    x = np.expand_dims(x_img, axis=0).astype(np.float32)
 
     preds = clf.predict(x, verbose=0)[0]
     probs = preds / np.sum(preds)
@@ -423,17 +372,18 @@ if page == "0) Clean (Defenseless) Baseline":
             st.error("Could not decode image.")
             st.stop()
 
-        st.image(img_bgr, caption="Uploaded clean image (BGR)", channels="BGR")
+        st.image(img_bgr, caption="Uploaded clean image — original resolution (BGR)", channels="BGR")
 
-        x_clean, img32_clean = to_cifar(img_bgr)
+        x_clean, img_clean = to_native(img_bgr)
+        st.caption(f"Model input kept at original resolution: {img_clean.shape[1]}×{img_clean.shape[0]} → tensor {x_clean.shape}")
         st.session_state.x_clean = x_clean
-        st.session_state.img32_clean = img32_clean
+        st.session_state.img_clean = img_clean
 
         st.subheader("Base classifier on clean image (x_clean)")
         if clf is None:
             st.info("Base classifier not available.")
         else:
-            pred_clean, top3_clean, _ = classify_with_base(img32_clean)
+            pred_clean, top3_clean, _ = classify_with_base(img_clean)
             if pred_clean is None:
                 st.warning("Base classifier prediction failed.")
             else:
@@ -444,9 +394,9 @@ if page == "0) Clean (Defenseless) Baseline":
 
         st.subheader("Download")
         st.download_button(
-            "Download clean 32×32 image (PNG)",
-            data=png_bytes_from_float01(img32_clean),
-            file_name="clean_32x32.png",
+            "Download clean image at original resolution (PNG)",
+            data=png_bytes_from_float01(img_clean),
+            file_name="clean_original_resolution.png",
             mime="image/png"
         )
 
@@ -455,7 +405,7 @@ elif page == "1) Upload & Attack Detection":
     st.header("1) Upload & Attack Detection")
     st.write(
         "Upload the **ATTACKED** image once. The app will automatically:\n"
-        "- Convert to 32×32 CIFAR-10 format\n"
+        "- Keep the uploaded image at its original resolution (no resizing)\n"
         "- Predict **δ̂** (attack delta)\n"
         "- Show a heatmap of |δ̂|\n"
         "- Predict **attack type** (FGSM vs PGD) from δ̂\n"
@@ -474,14 +424,15 @@ elif page == "1) Upload & Attack Detection":
             st.error("Could not decode image.")
             st.stop()
 
-        st.image(img_bgr, caption="Uploaded attacked image (BGR)", channels="BGR")
+        st.image(img_bgr, caption="Uploaded attacked image — original resolution (BGR)", channels="BGR")
 
-        x_adv, img32 = to_cifar(img_bgr)
+        x_adv, img_adv = to_native(img_bgr)
+        st.caption(f"Model input kept at original resolution: {img_adv.shape[1]}×{img_adv.shape[0]} → tensor {x_adv.shape}")
         delta = D_adv.predict(x_adv, verbose=0)[0]
         hm, d_mean, d_max = delta_heatmap(delta)
 
         st.session_state.x_adv = x_adv
-        st.session_state.img32_adv = img32
+        st.session_state.img_adv = img_adv
         st.session_state.delta = delta
         st.session_state.delta_hm = hm
 
@@ -494,7 +445,7 @@ elif page == "1) Upload & Attack Detection":
 
         c1, c2 = st.columns(2)
         with c1:
-            st.image(img32, caption="Attacked (32×32 RGB)", channels="RGB")
+            st.image(img_adv, caption=f"Attacked (native {img_adv.shape[1]}×{img_adv.shape[0]} RGB)", channels="RGB")
         with c2:
             st.image(hm, caption="|δ̂| heatmap", channels="RGB")
 
@@ -507,14 +458,14 @@ elif page == "1) Upload & Attack Detection":
         if clf is None:
             st.info("Base classifier not available.")
         else:
-            if st.session_state.img32_clean is not None:
-                pred_clean, top3_clean, _ = classify_with_base(st.session_state.img32_clean)
+            if st.session_state.img_clean is not None:
+                pred_clean, top3_clean, _ = classify_with_base(st.session_state.img_clean)
                 if pred_clean is not None:
                     st.write(f"**Clean prediction:** {pred_clean[0]} ({pred_clean[1]:.2f})")
             else:
                 st.caption("Tip: upload a clean baseline image on **Page 0** to compare.")
 
-            pred_adv, top3_adv, _ = classify_with_base(img32)
+            pred_adv, top3_adv, _ = classify_with_base(img_adv)
             if pred_adv is not None:
                 st.write(f"**Attacked prediction:** {pred_adv[0]} ({pred_adv[1]:.2f})")
 
@@ -619,7 +570,7 @@ elif page == "3) Defense Outputs (Reconstruct + Mix)":
 
     cols = st.columns(3 if x_mix is None else 4)
     with cols[0]:
-        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
+        st.image(st.session_state.img_adv, caption="Attacked (x_adv, native resolution)", channels="RGB")
     with cols[1]:
         st.image(st.session_state.delta_hm, caption="|δ̂| heatmap", channels="RGB")
     with cols[2]:
@@ -720,7 +671,7 @@ elif page == "4) Final Classification (Summary + Downloads)":
 
     show_cols = st.columns(4 if st.session_state.x_mix is not None else 3)
     with show_cols[0]:
-        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
+        st.image(st.session_state.img_adv, caption="Attacked (x_adv, native resolution)", channels="RGB")
     with show_cols[1]:
         st.image(st.session_state.x_rec, caption="Reconstructed (x_rec)", channels="RGB")
     with show_cols[2]:
