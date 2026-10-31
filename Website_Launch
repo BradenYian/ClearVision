@@ -38,17 +38,13 @@ def launch_website():
   print(tunnel.public_url)
   !streamlit run --server.port 80 app.py > /dev/null
 !ngrok authtoken 30iO8wSjR6B6RzKjBmEu41rkG98_K1aCukdpugCxbTk1KB9R
-
 !gdown 107wc-96WXFoQqoMJ3yssn3qIi5HxIDZa
 !gdown 1cHmPkUzkHOorE5RYXWhyyBcKdLUaNWk9
 !gdown 1MPct9YvPv-cerTT9K7Oy1UfkFCg2Xh5K
 !gdown 1qH3KajXHUYQUEuPFM8S8KaPFt1i20eVe
 !gdown 14hZ20O8eUeWQy5loYlfzbyp4YG_fm1sD
-
-!cd /content
-!mv reconstructor_R.keras reconstructor.keras
-!ls -lh reconstructor*.keras
-%%writefile app.py
+!gdown 1mwjfoQjpDq2fr4e5_4rlFt-85yliwPvA
+%%writefile /content/app.py
 import streamlit as st
 import numpy as np
 import cv2
@@ -58,59 +54,502 @@ import json
 import zipfile
 import tempfile
 import io
-
+import hashlib
+import base64
+import html as html_lib
 import keras
 from keras import layers
 from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
-
-
 @keras.utils.register_keras_serializable(package="custom")
 class EffNetV2Preprocess(layers.Layer):
     def call(self, inputs):
         inputs = tf.cast(inputs, tf.float32)
         return preprocess_input(inputs * 255.0)
-
     def get_config(self):
         return super().get_config()
-
-
 CLASSIFIER_PATH = "cifar10_clf.keras"
-
 DELTA_MODEL_PATH = "delta_student_adv_only.keras"
 DELTA_PATCHED_PATH = "delta_student_adv_only.nolambda.keras"
-
 RECONSTRUCTOR_PATH = "reconstructor.keras"
 ATTACK_TYPE_PATH   = "attack_type_from_delta.keras"
-
-
 NORM_CLASSIFIER_PATH = "norm_classifier_with_norm.keras"
-
+BINARY_DETECTOR_PATH = "binary_attack_detector.keras"
+BINARY_DETECTOR_META_PATH = "binary_attack_detector_meta.json"
 cifar10_class_names = [
     "airplane", "automobile", "bird", "cat", "deer",
     "dog", "frog", "horse", "ship", "truck"
 ]
-
 ATTACK_LABELS = ["fgsm", "pgd"]
+st.set_page_config(
+    page_title="ClearVision | Adversarial Image Defense",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+# Brand colors for Streamlit's own widgets (slider, focus rings). Written once next to app.py if no
+# theme file exists yet; an existing .streamlit/config.toml is never touched.
+CV_THEME_TOML = """[theme]
+base = "light"
+primaryColor = "#1D4F9C"
+backgroundColor = "#F4F6FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B2A41"
+font = "sans serif"
 
-st.set_page_config(layout="wide")
-st.title("CIFAR-10 Defense Pipeline: Clean → (Attacked) Detection → Isolation → Reconstruction → Norm-Gated Mix → Final Classification")
+[server]
+maxUploadSize = 1024
+maxMessageSize = 1024
+"""
+try:
+    if not os.path.exists(os.path.join(".streamlit", "config.toml")):
+        os.makedirs(".streamlit", exist_ok=True)
+        with open(os.path.join(".streamlit", "config.toml"), "w", encoding="utf-8") as _f:
+            _f.write(CV_THEME_TOML)
+except OSError:
+    pass
 
-st.sidebar.info("Delta is NOT rescaled by eps (matches training: delta_true = x_adv - x_clean).")
 
-with st.expander("Debug: files in current directory"):
-    st.write(os.listdir("."))
+# =============================================================================
+# ClearVision visual system (presentation only — no model logic in this block)
+# =============================================================================
+CV_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&family=Oxanium:wght@600;700&display=swap');
+:root {
+  --cv-ink:#0E2A52; --cv-text:#1B2A41; --cv-muted:#5A6B85; --cv-line:#D9E0EC; --cv-line-2:#E8EDF5;
+  --cv-paper:#F4F6FA; --cv-card:#FFFFFF; --cv-blue:#1D4F9C; --cv-blue-2:#2F6BD0; --cv-tint:#EAF1FC;
+  --cv-red:#B8323C; --cv-red-tint:#FCEEEF; --cv-green:#11795A; --cv-green-tint:#E6F4EE;
+  --cv-amber:#94590A; --cv-amber-tint:#FDF4E3;
+  --cv-side:#0C2346; --cv-side-2:#16346A; --cv-side-text:#DCE6F5; --cv-side-muted:#8EA5C7;
+  --cv-font:'Public Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+/* ---------- base ---------- */
+.stApp { background: var(--cv-paper); color: var(--cv-text); font-family: var(--cv-font); }
+.stApp p, .stApp li, .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp small,
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp td, .stApp th,
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stCaptionContainer"] { font-family: var(--cv-font); }
+.stApp [data-testid="stMarkdownContainer"] p, .stApp [data-testid="stMarkdownContainer"] li { color: var(--cv-text); }
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] p { color: var(--cv-muted); }
+header[data-testid="stHeader"] { background: transparent; }
+[data-testid="stDecoration"], [data-testid="stAppDeployButton"], .stDeployButton, footer { display: none !important; }
+.block-container, [data-testid="stMainBlockContainer"] { padding-top: 2.4rem; padding-bottom: 4rem; max-width: 1240px; }
+.stApp a { color: var(--cv-blue-2); }
+
+/* ---------- sidebar ---------- */
+[data-testid="stSidebar"] { background: var(--cv-side); border-right: 1px solid #08193A; }
+[data-testid="stSidebar"] > div:first-child { background: var(--cv-side); }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] summary,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color: var(--cv-side-text); }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: var(--cv-side-muted); }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.10); margin: 1rem 0; }
+[data-testid="stSidebar"] [data-testid="stExpander"] details { border: 1px solid rgba(255,255,255,.12); border-radius: 10px; background: rgba(255,255,255,.03); }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover { background: rgba(255,255,255,.05); }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary svg, [data-testid="stSidebar"] [data-testid="stExpander"] summary span { color: var(--cv-side-text); fill: var(--cv-side-text); }
+[data-testid="stSidebar"] [data-testid="stSliderTickBarMin"], [data-testid="stSidebar"] [data-testid="stSliderTickBarMax"] { color: var(--cv-side-muted); }
+[data-testid="stSidebar"] code { background: rgba(255,255,255,.08); color: #CFE0FF; }
+[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] svg,
+[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] span { color: var(--cv-side-text); }
+
+/* sidebar navigation: st.radio restyled as a numbered step list.
+   Two selector sets: Streamlit >= 1.5x (react-aria, stRadioOption) and older (baseweb label). */
+[data-testid="stSidebar"] [role="radiogroup"] { gap: 2px; counter-reset: cvstep; width: 100%; }
+[data-testid="stSidebar"] [data-testid="stElementContainer"]:has([role="radiogroup"]),
+[data-testid="stSidebar"] [data-testid="stRadio"], [data-testid="stSidebar"] [data-testid="stRadio"] > div { width: 100% !important; }
+[data-testid="stSidebar"] [role="radiogroup"] > div { width: 100%; margin: 0; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"],
+[data-testid="stSidebar"] [role="radiogroup"] > label {
+  width: 100%; margin: 0; padding: 9px 10px; border-radius: 9px; cursor: pointer; box-sizing: border-box;
+  display: flex; align-items: center; gap: 12px; transition: background .15s ease;
+}
+[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:not([data-testid="stMarkdownContainer"]),
+[data-testid="stSidebar"] [role="radiogroup"] > label > div:first-child { display: none; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"]::before,
+[data-testid="stSidebar"] [role="radiogroup"] > label::before {
+  counter-increment: cvstep; content: counter(cvstep);
+  flex: 0 0 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font: 600 12px/1 var(--cv-font); color: var(--cv-side-muted); border: 1.5px solid rgba(142,165,199,.45); box-sizing: border-box;
+}
+[data-testid="stSidebar"] [role="radiogroup"] > div:first-child [data-testid="stRadioOption"]::before,
+[data-testid="stSidebar"] [role="radiogroup"] > label:first-child::before { counter-increment: none; content: "\\2302"; font-size: 14px; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] p,
+[data-testid="stSidebar"] [role="radiogroup"] > label p { font-size: 14.5px; font-weight: 500; color: var(--cv-side-text); margin: 0; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover,
+[data-testid="stSidebar"] [role="radiogroup"] > label:hover { background: rgba(255,255,255,.06); }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"],
+[data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) { background: var(--cv-side-2); box-shadow: inset 3px 0 0 #7FAEFF; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p,
+[data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) p { color: #FFFFFF; font-weight: 600; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"]::before,
+[data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked)::before { background: #7FAEFF; border-color: #7FAEFF; color: var(--cv-side); }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-focus-visible="true"],
+[data-testid="stSidebar"] [role="radiogroup"] > label:has(:focus-visible) { outline: 2px solid #7FAEFF; outline-offset: 1px; }
+[data-testid="stSidebar"] [data-testid="stTooltipIcon"] button { background: transparent; border: none; }
+[data-testid="stSidebar"] [data-testid="stTooltipIcon"] svg { color: var(--cv-side-muted); stroke: var(--cv-side-muted); }
+
+/* ---------- buttons & widgets ---------- */
+.stApp button[kind="primary"], .stApp [data-testid="stBaseButton-primary"] {
+  background: var(--cv-blue); border: 1px solid var(--cv-blue); color: #fff; font-weight: 600; border-radius: 10px; padding: .55rem 1.1rem;
+}
+.stApp button[kind="primary"]:hover, .stApp [data-testid="stBaseButton-primary"]:hover { background: #173F80; border-color: #173F80; color: #fff; }
+.stApp button[kind="primary"] p, .stApp [data-testid="stBaseButton-primary"] p { color: #fff; font-weight: 600; }
+.stApp button[kind="secondary"], .stApp [data-testid="stBaseButton-secondary"] {
+  background: #fff; border: 1px solid var(--cv-line); color: var(--cv-ink); font-weight: 600; border-radius: 10px; padding: .55rem 1.1rem;
+}
+.stApp button[kind="secondary"]:hover, .stApp [data-testid="stBaseButton-secondary"]:hover { border-color: var(--cv-blue-2); color: var(--cv-blue); }
+.stApp button[kind="secondary"] p, .stApp [data-testid="stBaseButton-secondary"] p { color: inherit; font-weight: 600; }
+[data-testid="stDownloadButton"] button { width: 100%; justify-content: flex-start; background: #fff; border: 1px solid var(--cv-line); border-radius: 10px; color: var(--cv-ink); }
+[data-testid="stDownloadButton"] button:hover { border-color: var(--cv-blue-2); color: var(--cv-blue); background: var(--cv-tint); }
+[data-testid="stDownloadButton"] button p { font-weight: 600; font-size: 14px; color: inherit; }
+.stApp button:focus-visible { outline: 2px solid var(--cv-blue-2) !important; outline-offset: 2px; }
+
+[data-testid="stFileUploader"] section, [data-testid="stFileUploaderDropzone"] {
+  background: #fff; border: 1.5px dashed #9DB4D8; border-radius: 14px; padding: 1.4rem 1.2rem;
+}
+[data-testid="stFileUploader"] section:hover, [data-testid="stFileUploaderDropzone"]:hover { border-color: var(--cv-blue-2); background: #FAFCFF; }
+[data-testid="stFileUploaderDropzoneInstructions"] span, [data-testid="stFileUploaderDropzoneInstructions"] small { color: var(--cv-muted); }
+[data-testid="stFileUploaderDropzoneInstructions"] span:first-of-type { color: var(--cv-ink); font-weight: 600; }
+[data-testid="stFileUploader"] [data-testid="stWidgetLabel"] p { font-weight: 600; color: var(--cv-ink); font-size: 15px; }
+[data-testid="stFileUploaderFile"] { background: #fff; border: 1px solid var(--cv-line); border-radius: 10px; padding: .4rem .7rem; }
+[data-testid="stFileChip"] { background: var(--cv-tint) !important; color: var(--cv-ink) !important; border: 1px solid #CADAF3; }
+
+.stApp [data-testid="stMain"] [data-testid="stExpander"] details,
+.stApp section.main [data-testid="stExpander"] details { background: #fff; border: 1px solid var(--cv-line); border-radius: 12px; }
+.stApp [data-testid="stMain"] [data-testid="stExpander"] summary p { font-weight: 600; color: var(--cv-ink); }
+
+.stApp [data-testid="stMain"] [data-testid="stVerticalBlockBorderWrapper"],
+.stApp [data-testid="stMain"] [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] > [data-testid="stMarkdown"] .cv-boxmark) {
+  background: #fff; border-color: var(--cv-line) !important; border-radius: 14px; }
+.stApp [data-testid="stElementContainer"]:has(.cv-boxmark), .stApp .element-container:has(.cv-boxmark),
+.stApp [data-testid="stElementContainer"]:has(.cv-right), .stApp .element-container:has(.cv-right) { display: none; }
+.stApp [data-testid="stColumn"]:has(.cv-right) [data-testid="stVerticalBlock"],
+.stApp [data-testid="column"]:has(.cv-right) [data-testid="stVerticalBlock"] { align-items: flex-end; }
+[data-testid="stSpinner"] p, [data-testid="stSpinner"] div { color: var(--cv-ink); font-weight: 500; }
+[data-testid="stAlert"] { border-radius: 12px; }
+
+/* ---------- ClearVision components ---------- */
+.cv-head { margin: 0 0 1.4rem 0; }
+.cv-head .cv-step { color: var(--cv-blue-2); font-weight: 600; font-size: 14px; margin-bottom: .35rem; }
+.cv-head h1 { font-family: var(--cv-font); font-size: 2.15rem; line-height: 1.15; font-weight: 800; color: var(--cv-ink); margin: 0 0 .5rem 0; padding: 0; letter-spacing: -0.015em; }
+.cv-head p.cv-lead { font-size: 1.05rem; line-height: 1.6; color: var(--cv-muted); max-width: 72ch; margin: 0; }
+.cv-h2 { font-size: 1.15rem; font-weight: 700; color: var(--cv-ink); margin: .4rem 0 .2rem 0; letter-spacing: -0.005em; }
+.cv-h2-sub { color: var(--cv-muted); font-size: .95rem; margin: 0 0 .8rem 0; line-height: 1.5; max-width: 75ch; }
+.cv-num { font-variant-numeric: tabular-nums; }
+
+/* brand (sidebar) */
+.cv-brand { display: flex; align-items: center; gap: 12px; padding: .2rem 0 1.1rem 0; border-bottom: 1px solid rgba(255,255,255,.10); margin-bottom: .9rem; }
+.cv-wordmark { font-family: 'Oxanium', var(--cv-font); font-weight: 700; font-size: 1.45rem; letter-spacing: .01em; color: #fff; line-height: 1.1; }
+.cv-tagline { font-size: 12.5px; color: var(--cv-side-muted); margin-top: 3px; }
+.cv-side-label { font-size: 12.5px; font-weight: 600; color: var(--cv-side-muted); margin: 1.1rem 0 .45rem 2px; }
+
+/* system status (sidebar) */
+.cv-status { list-style: none; margin: 0; padding: 0; }
+.cv-status li { display: flex; align-items: flex-start; gap: 9px; padding: 5px 0; font-size: 13px; color: var(--cv-side-text); line-height: 1.35; }
+.cv-status li small { display: block; color: var(--cv-side-muted); font-size: 11.5px; word-break: break-all; }
+.cv-led { flex: 0 0 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: #4ADE9B; box-shadow: 0 0 0 3px rgba(74,222,155,.15); }
+.cv-led.off { background: #FF6B74; box-shadow: 0 0 0 3px rgba(255,107,116,.15); }
+.cv-led.warn { background: #F5B640; box-shadow: 0 0 0 3px rgba(245,182,64,.15); }
+.cv-status-sum { display: flex; align-items: center; gap: 9px; font-size: 13.5px; font-weight: 600; color: #fff; margin-bottom: .2rem; }
+.cv-status-sum .cv-led { margin-top: 0; }
+
+/* pipeline rail — the signature element */
+.cv-rail { display: flex; gap: 0; background: #fff; border: 1px solid var(--cv-line); border-radius: 16px; padding: 18px 20px 16px; margin: 0 0 1.5rem 0; }
+.cv-stage { position: relative; flex: 1 1 0; min-width: 0; padding-right: 14px; }
+.cv-stage::after { content: ""; position: absolute; top: 14px; left: 36px; right: 8px; height: 2px; background: var(--cv-line); border-radius: 2px; }
+.cv-stage:last-child::after { display: none; }
+.cv-stage.done::after { background: var(--cv-blue-2); }
+.cv-stage.alert::after { background: linear-gradient(90deg, var(--cv-red), var(--cv-blue-2)); }
+.cv-stage.skip::after { background: repeating-linear-gradient(90deg, var(--cv-line) 0 5px, transparent 5px 9px); }
+.cv-dot { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: #fff; border: 2px solid var(--cv-line); color: var(--cv-muted); font-weight: 700; font-size: 13px; position: relative; z-index: 1; }
+.cv-stage.done .cv-dot { background: var(--cv-blue); border-color: var(--cv-blue); color: #fff; }
+.cv-stage.alert .cv-dot { background: var(--cv-red); border-color: var(--cv-red); color: #fff; }
+.cv-stage.clean .cv-dot { background: var(--cv-green); border-color: var(--cv-green); color: #fff; }
+.cv-stage.skip .cv-dot { border-style: dashed; color: #A9B6CA; }
+.cv-stage b { display: block; margin-top: 10px; font-size: 14.5px; color: var(--cv-ink); font-weight: 700; }
+.cv-stage span { display: block; font-size: 12.8px; color: var(--cv-muted); margin-top: 2px; line-height: 1.4; }
+.cv-stage.alert span.cv-val { color: var(--cv-red); font-weight: 600; }
+.cv-stage.clean span.cv-val { color: var(--cv-green); font-weight: 600; }
+.cv-stage.done span.cv-val { color: var(--cv-blue); font-weight: 600; }
+.cv-stage.skip b { color: #8C9AB0; }
+
+/* cards */
+.cv-card { background: #fff; border: 1px solid var(--cv-line); border-radius: 14px; padding: 18px 20px; margin-bottom: 1rem; }
+.cv-card h4 { margin: 0 0 .25rem 0; font-size: 1rem; font-weight: 700; color: var(--cv-ink); padding: 0; }
+.cv-card p { margin: 0; color: var(--cv-muted); font-size: .94rem; line-height: 1.55; }
+.cv-kicker { font-size: 13px; font-weight: 600; color: var(--cv-muted); margin-bottom: 6px; }
+
+/* verdict */
+.cv-verdict { border-radius: 14px; padding: 18px 20px; border: 1px solid var(--cv-line); background: #fff; margin-bottom: 1rem; }
+.cv-verdict .cv-v-label { font-size: 2.1rem; font-weight: 800; color: var(--cv-ink); line-height: 1.1; text-transform: capitalize; letter-spacing: -0.01em; }
+.cv-verdict .cv-v-conf { font-size: .98rem; color: var(--cv-muted); margin-top: 4px; }
+.cv-verdict.good { border-color: #B6DCCB; background: linear-gradient(180deg, var(--cv-green-tint), #fff 70%); }
+.cv-verdict.good .cv-v-label { color: var(--cv-green); }
+.cv-verdict.bad { border-color: #EBC1C5; background: linear-gradient(180deg, var(--cv-red-tint), #fff 70%); }
+.cv-verdict.bad .cv-v-label { color: var(--cv-red); }
+.cv-verdict.blue { border-color: #C5D6F1; background: linear-gradient(180deg, var(--cv-tint), #fff 70%); }
+
+/* probability bars */
+.cv-bars { display: flex; flex-direction: column; gap: 9px; margin-top: 4px; }
+.cv-bar { display: grid; grid-template-columns: minmax(84px, 120px) 1fr 62px; align-items: center; gap: 12px; font-size: 14px; }
+.cv-bar .n { color: var(--cv-text); font-weight: 500; text-transform: capitalize; }
+.cv-bar .t { height: 9px; background: var(--cv-line-2); border-radius: 6px; overflow: hidden; }
+.cv-bar .f { height: 100%; background: var(--cv-blue-2); border-radius: 6px; }
+.cv-bar.top .n { font-weight: 700; color: var(--cv-ink); }
+.cv-bar .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--cv-muted); font-weight: 600; }
+.cv-bars.red .f { background: var(--cv-red); } .cv-bars.green .f { background: var(--cv-green); }
+.cv-bar.dim .f { background: #AFC0DA; }
+
+/* detection meter */
+.cv-meter { position: relative; height: 14px; border-radius: 8px; background: var(--cv-line-2); margin: 18px 0 30px; }
+.cv-meter .f { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 8px; }
+.cv-meter .thr { position: absolute; top: -7px; bottom: -7px; width: 2px; background: var(--cv-ink); }
+.cv-meter .thr i { position: absolute; top: 30px; left: 50%; transform: translateX(-50%); font-style: normal; font-size: 12px; color: var(--cv-muted); white-space: nowrap; }
+.cv-big { font-size: 2.6rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+
+/* status chips */
+.cv-chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px; font-size: 13.5px; font-weight: 600; border: 1px solid transparent; }
+.cv-chip.red { background: var(--cv-red-tint); color: var(--cv-red); border-color: #EFC9CC; }
+.cv-chip.green { background: var(--cv-green-tint); color: var(--cv-green); border-color: #BFE0D2; }
+.cv-chip.blue { background: var(--cv-tint); color: var(--cv-blue); border-color: #CADAF3; }
+.cv-chip.amber { background: var(--cv-amber-tint); color: var(--cv-amber); border-color: #F0D9AE; }
+.cv-chip.grey { background: #EEF1F6; color: var(--cv-muted); border-color: var(--cv-line); }
+
+/* image strip */
+.cv-strip { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin: .3rem 0 1rem; }
+.cv-tile { margin: 0; flex: 1 1 170px; max-width: 260px; background: #fff; border: 1px solid var(--cv-line); border-radius: 12px; padding: 10px; }
+.cv-tile .im { aspect-ratio: 1 / 1; border-radius: 8px; overflow: hidden; background: #E9EDF4; display: flex; align-items: center; justify-content: center; }
+.cv-tile img { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; image-rendering: crisp-edges; display: block; }
+.cv-tile.photo img { image-rendering: auto; }
+.cv-tile figcaption { margin-top: 9px; }
+.cv-tile figcaption b { display: block; font-size: 14px; color: var(--cv-ink); font-weight: 700; }
+.cv-tile figcaption span { display: block; font-size: 12.5px; color: var(--cv-muted); line-height: 1.4; margin-top: 2px; }
+.cv-tile.red { border-color: #EBC1C5; } .cv-tile.green { border-color: #B6DCCB; box-shadow: 0 0 0 3px rgba(17,121,90,.08); }
+.cv-tile.blue { border-color: #B9CDEE; }
+.cv-arrow { display: flex; align-items: center; color: #9AAAC2; flex: 0 0 auto; padding-bottom: 40px; }
+.cv-tile figcaption span.cv-tag { display: inline-block; margin-top: 6px; font-size: 11.5px; font-weight: 700; color: var(--cv-green); background: var(--cv-green-tint); padding: 2px 8px; border-radius: 999px; }
+
+/* before/after */
+.cv-ba { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 1rem; }
+.cv-ba-side { background: #fff; border: 1px solid var(--cv-line); border-radius: 16px; padding: 16px; display: grid; grid-template-columns: 132px 1fr; gap: 16px; align-items: center; }
+.cv-ba-side img { width: 132px; height: 132px; border-radius: 10px; image-rendering: pixelated; display: block; }
+.cv-ba-side.bad { border-color: #EBC1C5; background: linear-gradient(135deg, var(--cv-red-tint), #fff 60%); }
+.cv-ba-side.good { border-color: #B6DCCB; background: linear-gradient(135deg, var(--cv-green-tint), #fff 60%); }
+.cv-ba-side .k { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
+.cv-ba-side.bad .k { color: var(--cv-red); } .cv-ba-side.good .k { color: var(--cv-green); }
+.cv-ba-side .l { font-size: 1.85rem; font-weight: 800; color: var(--cv-ink); text-transform: capitalize; line-height: 1.1; letter-spacing: -0.01em; }
+.cv-ba-side .c { color: var(--cv-muted); font-size: .93rem; margin-top: 3px; }
+.cv-outcome { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-radius: 12px; margin-bottom: 1rem; font-size: .98rem; line-height: 1.45; }
+.cv-outcome.good { background: var(--cv-green-tint); color: #0B5A43; border: 1px solid #BFE0D2; }
+.cv-outcome.info { background: var(--cv-tint); color: var(--cv-ink); border: 1px solid #CADAF3; }
+.cv-outcome.warn { background: var(--cv-amber-tint); color: #6E4205; border: 1px solid #F0D9AE; }
+.cv-outcome.bad { background: var(--cv-red-tint); color: #7E1F27; border: 1px solid #EFC9CC; }
+.cv-outcome svg { flex: 0 0 auto; }
+
+/* Streamlit pulls each markdown block up by 1rem; give the last block in a card room to breathe */
+.cv-bars, .cv-kv, .cv-empty, .cv-steps { margin-bottom: 1rem !important; }
+/* key-value table */
+.cv-kv { width: 100%; border-collapse: collapse; font-size: 14px; }
+.cv-kv, .cv-kv tr, .cv-kv tbody { border: none !important; background: transparent !important; }
+.cv-kv td { padding: 9px 12px 9px 0 !important; border: none !important; border-bottom: 1px solid var(--cv-line-2) !important; vertical-align: top; background: transparent !important; }
+.cv-kv tr:last-child td { border-bottom: none !important; }
+.cv-kv td:first-child { color: var(--cv-muted); width: 44%; padding-right: 12px; }
+.cv-kv td:last-child { color: var(--cv-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cv-kv code { font-size: 12px; background: var(--cv-tint); color: var(--cv-blue); padding: 2px 6px; border-radius: 5px; white-space: normal; word-break: break-word; line-height: 1.7; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+
+/* empty state */
+.cv-empty { border: 1.5px dashed var(--cv-line); border-radius: 16px; padding: 34px 26px; text-align: center; background: rgba(255,255,255,.55); }
+.cv-empty b { display: block; color: var(--cv-ink); font-size: 1.05rem; margin: 10px 0 4px; }
+.cv-empty span { color: var(--cv-muted); font-size: .95rem; line-height: 1.5; }
+
+/* overview */
+.cv-hero { display: grid; grid-template-columns: 1.35fr 1fr; gap: 28px; align-items: center; background: #fff; border: 1px solid var(--cv-line); border-radius: 20px; padding: 34px 38px; margin-bottom: 1.2rem; position: relative; overflow: hidden; }
+.cv-hero::before { content: ""; position: absolute; inset: 0; background-image: linear-gradient(var(--cv-line-2) 1px, transparent 1px), linear-gradient(90deg, var(--cv-line-2) 1px, transparent 1px); background-size: 22px 22px; mask-image: linear-gradient(90deg, transparent 35%, #000 85%); -webkit-mask-image: linear-gradient(90deg, transparent 35%, #000 85%); opacity: .8; }
+.cv-hero > * { position: relative; }
+.cv-hero h1 { font-size: 2.7rem; line-height: 1.08; font-weight: 800; color: var(--cv-ink); margin: 0 0 .9rem; letter-spacing: -0.025em; padding: 0; }
+.cv-hero p { font-size: 1.08rem; line-height: 1.62; color: var(--cv-muted); margin: 0; max-width: 58ch; }
+.cv-hero .cv-mark { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.cv-hero .cv-mark .cv-wm { font-family: 'Oxanium', var(--cv-font); font-weight: 700; font-size: 2rem; color: var(--cv-blue); margin-top: 6px; letter-spacing: .02em; }
+.cv-hero .cv-mark .cv-tl { font-family: 'Oxanium', var(--cv-font); font-weight: 600; color: var(--cv-blue); font-size: 1rem; letter-spacing: .04em; }
+.cv-pillars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 1.2rem; }
+.cv-pillar { background: #fff; border: 1px solid var(--cv-line); border-radius: 16px; padding: 20px 22px; border-top: 4px solid var(--cv-blue); }
+.cv-pillar:nth-child(2) { border-top-color: var(--cv-blue-2); } .cv-pillar:nth-child(3) { border-top-color: var(--cv-green); }
+.cv-pillar h3 { font-family: 'Oxanium', var(--cv-font); font-size: 1.35rem; font-weight: 700; color: var(--cv-ink); margin: 0 0 .35rem; padding: 0; }
+.cv-pillar p { color: var(--cv-muted); font-size: .95rem; line-height: 1.55; margin: 0 0 .7rem; }
+.cv-pillar small { color: var(--cv-blue); font-size: 12.5px; font-weight: 600; line-height: 1.5; display: block; }
+.cv-steps { margin: 0; padding: 0; list-style: none; counter-reset: cvs; }
+.cv-steps li { counter-increment: cvs; position: relative; padding: 0 0 14px 44px; color: var(--cv-text); line-height: 1.5; font-size: .97rem; }
+.cv-steps li::before { content: counter(cvs); position: absolute; left: 0; top: -2px; width: 28px; height: 28px; border-radius: 50%; background: var(--cv-tint); color: var(--cv-blue); font-weight: 700; font-size: 13px; display: flex; align-items: center; justify-content: center; }
+.cv-steps li b { color: var(--cv-ink); }
+
+@media (max-width: 900px) {
+  .cv-hero { grid-template-columns: 1fr; padding: 26px 22px; } .cv-hero h1 { font-size: 2.05rem; }
+  .cv-pillars, .cv-ba { grid-template-columns: 1fr; }
+  .cv-rail { flex-wrap: wrap; row-gap: 14px; } .cv-stage { flex: 1 1 45%; } .cv-stage::after { display: none; }
+  .cv-ba-side { grid-template-columns: 96px 1fr; } .cv-ba-side img { width: 96px; height: 96px; }
+  .cv-arrow { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+"""
+st.markdown(CV_CSS, unsafe_allow_html=True)
 
 
+def html(markup: str, target=None):
+    """Render raw HTML. Lines are stripped so Markdown never turns indents into code blocks."""
+    cleaned = " ".join(line.strip() for line in markup.strip().splitlines() if line.strip())
+    (target or st).markdown(cleaned, unsafe_allow_html=True)
+
+
+def esc(value) -> str:
+    return html_lib.escape(str(value))
+
+
+def logo_svg(size=120, fg="#1D4F9C", accent="#2F6BD0", bg="#FFFFFF", circuits=True):
+    """ClearVision mark: a shield guarding an eye whose iris dissolves from noisy pixels into a clean arc."""
+    sw = 4.6 if circuits else 6.0
+    pix = []
+    for x, rows, o in [(55.6, [47.6, 52.6, 57.6, 62.6, 67.6], 1.0),
+                       (50.6, [50.1, 55.1, 60.1, 65.1], 0.9),
+                       (45.6, [55.1, 61.1], 0.65),
+                       (40.4, [58.1], 0.4)]:
+        for y in rows:
+            pix.append(f'<rect x="{x}" y="{y}" width="4.4" height="4.4" rx="0.7" fill="{accent}" opacity="{o}"/>')
+    circuit = ""
+    if circuits:
+        nodes = [(13, 46), (10, 72), (107, 46), (110, 72), (44, 9), (76, 9), (60, 4)]
+        circuit = (
+            f'<g stroke="{fg}" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M29 46 H16"/><path d="M29 60 H22 V72 H13"/><path d="M31 76 H20 V88"/>'
+            '<path d="M91 46 H104"/><path d="M91 60 H98 V72 H107"/><path d="M89 76 H100 V88"/>'
+            '<path d="M44 21 V12"/><path d="M76 21 V12"/><path d="M60 15 V7"/>'
+            '<path d="M48 101 V112"/><path d="M72 101 V112"/><path d="M60 107 V116"/></g>'
+            + "".join(f'<circle cx="{x}" cy="{y}" r="3.2" fill="{bg}" stroke="{fg}" stroke-width="2.4"/>' for x, y in nodes)
+        )
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ClearVision logo">'
+        f'{circuit}'
+        f'<path d="M60 15 L91 26 V55 C91 77 78 93 60 104 C42 93 29 77 29 55 V26 Z" fill="{bg}" stroke="{fg}" stroke-width="{sw}" stroke-linejoin="round"/>'
+        f'<path d="M33 60 Q60 31 87 60 Q60 89 33 60 Z" fill="none" stroke="{fg}" stroke-width="{sw * 0.85:.2f}" stroke-linejoin="round"/>'
+        f'<path d="M60 47 A13 13 0 0 1 60 73 Z" fill="{accent}"/>'
+        f'{"".join(pix)}'
+        f'<circle cx="60" cy="60" r="4.2" fill="{bg}"/></svg>'
+    )
+
+
+ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>'
+ICON_ALERT = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M12 6v8"/><path d="M12 18.5v.01"/></svg>'
+ICON_SKIP = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 12h12"/></svg>'
+ICON_ARROW = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg>'
+ICON_SHIELD_OK = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg>'
+ICON_WARN = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4.5"/><path d="M12 17.5v.01"/></svg>'
+ICON_INFO = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7.5v.01"/></svg>'
+ICON_UPLOAD = '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#9DB4D8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 16l5-5 4 4 3-3 6 6"/><circle cx="15.5" cy="8.5" r="1.5"/></svg>'
+
+
+def to_display_rgb(img, kind="float"):
+    """Convert a model array or decoded upload into a display-ready uint8 RGB image (display only)."""
+    if kind == "float":
+        arr = np.clip(np.asarray(img, dtype=np.float32) * 255.0, 0, 255).astype(np.uint8)
+    elif kind == "bgr":
+        arr = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    else:
+        arr = np.asarray(img).astype(np.uint8)
+    h, w = arr.shape[:2]
+    if max(h, w) < 160:
+        scale = int(np.ceil(256 / max(h, w)))
+        arr = cv2.resize(arr, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+    elif max(h, w) > 520:
+        s = 520 / max(h, w)
+        arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+    return arr
+
+
+def data_uri(img, kind="float"):
+    arr = to_display_rgb(img, kind)
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+    if not ok:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def tile(img, title, sub="", kind="float", tone="", tag=""):
+    photo = " photo" if kind == "bgr" else ""
+    tag_html = f'<span class="cv-tag">{esc(tag)}</span>' if tag else ""
+    return (f'<figure class="cv-tile {tone}{photo}"><div class="im"><img src="{data_uri(img, kind)}" alt="{esc(title)}"></div>'
+            f'<figcaption><b>{esc(title)}</b><span>{esc(sub)}</span>{tag_html}</figcaption></figure>')
+
+
+def strip(tiles, arrows=True):
+    joiner = f'<div class="cv-arrow">{ICON_ARROW}</div>' if arrows else ""
+    return f'<div class="cv-strip">{joiner.join(tiles)}</div>'
+
+
+def bars_html(rows, tone="", dim_rest=True):
+    out = []
+    for i, (name, p) in enumerate(rows):
+        cls = "top" if i == 0 else ("dim" if dim_rest else "")
+        pct = max(0.0, min(1.0, float(p))) * 100
+        out.append(f'<div class="cv-bar {cls}"><span class="n">{esc(name)}</span><div class="t"><div class="f" style="width:{pct:.1f}%"></div></div><span class="v">{pct:.1f}%</span></div>')
+    return f'<div class="cv-bars {tone}">{"".join(out)}</div>'
+
+
+def verdict_html(kicker, label, conf, tone="blue", note=""):
+    note_html = f'<div class="cv-v-conf">{esc(note)}</div>' if note else ""
+    return (f'<div class="cv-verdict {tone}"><div class="cv-kicker">{esc(kicker)}</div>'
+            f'<div class="cv-v-label">{esc(label)}</div><div class="cv-v-conf cv-num">{conf:.1%} confidence</div>{note_html}</div>')
+
+
+def outcome(kind, text_html, target=None):
+    icon = {"good": ICON_SHIELD_OK, "bad": ICON_WARN, "warn": ICON_WARN}.get(kind, ICON_INFO)
+    html(f'<div class="cv-outcome {kind}">{icon}<div>{text_html}</div></div>', target)
+
+
+def page_header(step, title, lead):
+    step_html = f'<div class="cv-step">Step {step} of 5</div>' if step else ""
+    html(f'<div class="cv-head">{step_html}<h1>{esc(title)}</h1><p class="cv-lead">{lead}</p></div>')
+
+
+def section(title, sub=""):
+    sub_html = f'<p class="cv-h2-sub">{sub}</p>' if sub else ""
+    html(f'<div class="cv-h2">{esc(title)}</div>{sub_html}')
+
+
+def box():
+    """White card container. The hidden marker lets CSS find it in every Streamlit version."""
+    c = st.container(border=True)
+    c.markdown('<span class="cv-boxmark"></span>', unsafe_allow_html=True)
+    return c
+
+
+def empty_state(title, text):
+    html(f'<div class="cv-empty">{ICON_UPLOAD}<b>{esc(title)}</b><span>{text}</span></div>')
+
+
+def norm_display(label):
+    return {"Linf": "L∞", "L2": "L2"}.get(label, str(label))
+
+
+def friendly_mode(norm_label, alpha):
+    if norm_label == "L2":
+        return f"Reconstruction blended with the input (α = {alpha:.2f})"
+    if norm_label == "Linf":
+        return "Reconstruction used directly"
+    return "Not decided yet"
+
+
+# =============================================================================
+# Original pipeline helpers (unchanged)
+# =============================================================================
 def decode_image(uploaded_file):
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
 def to_cifar(img_bgr):
     img = cv2.resize(img_bgr, (32, 32), interpolation=cv2.INTER_AREA)
     img = cv2.cvtColor(img_bgr if img_bgr.shape[:2] == (32, 32) else img, cv2.COLOR_BGR2RGB)
     img = img.astype("float32") / 255.0
     return np.expand_dims(img, axis=0), img
-
 def delta_heatmap(delta):
     d = np.abs(delta)
     d_gray = d.mean(axis=-1)
@@ -118,23 +557,18 @@ def delta_heatmap(delta):
     d8 = (d_gray * 255).astype(np.uint8)
     hm = cv2.applyColorMap(d8, cv2.COLORMAP_MAGMA)
     return cv2.cvtColor(hm, cv2.COLOR_BGR2RGB), float(d.mean()), float(d.max())
-
 def png_bytes_from_rgb(rgb_img_uint8):
     ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb_img_uint8, cv2.COLOR_RGB2BGR))
     if not ok:
         return None
     return buf.tobytes()
-
 def png_bytes_from_float01(rgb_float01):
     arr = np.clip(rgb_float01 * 255.0, 0, 255).astype(np.uint8)
     return png_bytes_from_rgb(arr)
-
 def npy_download(data: np.ndarray):
     buf = io.BytesIO()
     np.save(buf, data.astype(np.float32))
     return buf.getvalue()
-
-
 def patch_remove_final_lambda(src_path: str, dst_path: str):
     """
     Remove final Lambda layer (often references CFG.eps) from a Keras 3 .keras zip model,
@@ -143,19 +577,15 @@ def patch_remove_final_lambda(src_path: str, dst_path: str):
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(src_path, "r") as z:
             z.extractall(tmpdir)
-
         config_path = os.path.join(tmpdir, "config.json")
         if not os.path.exists(config_path):
             raise RuntimeError("config.json not found inside .keras")
-
         with open(config_path, "r") as f:
             cfg = json.load(f)
-
         model_cfg = cfg["config"]
         layers_list = model_cfg["layers"]
         output_layers = model_cfg.get("output_layers", [])
         out_name = output_layers[0][0] if output_layers else None
-
         lambda_idx = None
         lambda_layer = None
         for i, layer_cfg in enumerate(layers_list):
@@ -166,10 +596,8 @@ def patch_remove_final_lambda(src_path: str, dst_path: str):
                     lambda_layer = layer_cfg
                     if name == out_name:
                         break
-
         if lambda_layer is None:
             raise RuntimeError("Could not find the final Lambda layer to remove.")
-
         inbound = lambda_layer.get("inbound_nodes", [])
         prev_layer_name = None
         if inbound and "args" in inbound[0] and inbound[0]["args"]:
@@ -178,29 +606,47 @@ def patch_remove_final_lambda(src_path: str, dst_path: str):
                 kh = first_arg.get("config", {}).get("keras_history", None)
                 if kh and len(kh) >= 1:
                     prev_layer_name = kh[0]
-
         if prev_layer_name is None:
             prev_layer_name = "activation_21"
-
         model_cfg["output_layers"] = [[prev_layer_name, 0, 0]]
         layers_list.pop(lambda_idx)
-
         with open(config_path, "w") as f:
             json.dump(cfg, f)
-
         if os.path.exists(dst_path):
             os.remove(dst_path)
-
         with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
             for root, _, files in os.walk(tmpdir):
                 for fn in files:
                     full = os.path.join(root, fn)
                     rel = os.path.relpath(full, tmpdir)
                     z.write(full, rel)
-
 @st.cache_resource
 def load_classifier():
     return keras.models.load_model(CLASSIFIER_PATH, compile=False, safe_mode=False)
+@st.cache_resource
+def load_binary_attack_detector(path: str, file_signature: tuple):
+    """file_signature invalidates the resource cache when .keras changes."""
+    model = keras.models.load_model(path, compile=False)
+    if tuple(model.input_shape[1:]) != (32, 32, 3):
+        raise ValueError(f"Binary detector expects input shape {model.input_shape}; wanted (None,32,32,3)")
+    if tuple(model.output_shape[1:]) != (1,):
+        raise ValueError(f"Binary detector must have 1 sigmoid output, got {model.output_shape}")
+    return model
+
+
+def load_detector_threshold():
+    """Use threshold saved by the training notebook (default 0.5)."""
+    if not os.path.exists(BINARY_DETECTOR_META_PATH):
+        return 0.5, False
+    with open(BINARY_DETECTOR_META_PATH, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if meta.get("labels") not in (None, {"0": "clean", "1": "attacked"}):
+        raise ValueError("Binary detector metadata does not specify 0=clean, 1=attacked")
+    threshold = float(meta.get("threshold", 0.5))
+    if not (0.0 < threshold < 1.0):
+        raise ValueError(f"Invalid detector threshold: {threshold}")
+    return threshold, True
+
 
 @st.cache_resource
 def load_delta_base(src_path: str, patched_path: str):
@@ -208,76 +654,95 @@ def load_delta_base(src_path: str, patched_path: str):
     if not os.path.exists(patched_path):
         patch_remove_final_lambda(src_path, patched_path)
     return keras.models.load_model(patched_path, compile=False, safe_mode=False)
-
 @st.cache_resource
 def load_reconstructor():
     return keras.models.load_model(RECONSTRUCTOR_PATH, compile=False, safe_mode=False)
-
 @st.cache_resource
 def load_attack_type_clf():
     return keras.models.load_model(ATTACK_TYPE_PATH, compile=False, safe_mode=False)
-
 @st.cache_resource
 def load_norm_clf():
     return keras.models.load_model(NORM_CLASSIFIER_PATH, compile=False, safe_mode=False)
 
+
+# =============================================================================
+# Model loading (same order, same files, same fallbacks). Status messages are
+# collected here and rendered in the sidebar / main area further down.
+# =============================================================================
+MODEL_STATUS = []   # (friendly name, file, state: "ok" | "off" | "warn", note)
+LOAD_ERRORS = []    # (title, detail) shown at the top of the main area
+binary_detector = None
+binary_threshold = 0.25
+detector_meta_note = ""
+try:
+    _, has_metadata = load_detector_threshold()
+    if not has_metadata:
+        detector_meta_note = "Detector metadata missing; using threshold 0.50"
+    if not os.path.isfile(BINARY_DETECTOR_PATH):
+        MODEL_STATUS.append(("Attack detector", BINARY_DETECTOR_PATH, "off", "File not found"))
+    else:
+        stat = os.stat(BINARY_DETECTOR_PATH)
+        binary_detector = load_binary_attack_detector(
+            BINARY_DETECTOR_PATH, (stat.st_size, stat.st_mtime_ns)
+        )
+        MODEL_STATUS.append(("Attack detector", BINARY_DETECTOR_PATH, "ok", f"Threshold {binary_threshold:.2f}"))
+except Exception as e:
+    MODEL_STATUS.append(("Attack detector", BINARY_DETECTOR_PATH, "off", "Could not be loaded"))
+    LOAD_ERRORS.append(("Binary detector load failed", f"{type(e).__name__}: {e}"))
+
+
 clf = None
 try:
     clf = load_classifier()
+    MODEL_STATUS.append(("Image classifier", CLASSIFIER_PATH, "ok", "CIFAR-10, 10 classes"))
 except Exception as e:
-    st.error(f"Classifier load failed: {type(e).__name__}: {e}")
-
+    MODEL_STATUS.append(("Image classifier", CLASSIFIER_PATH, "off", "Could not be loaded"))
+    LOAD_ERRORS.append(("Classifier load failed", f"{type(e).__name__}: {e}"))
 D_adv = None
 if os.path.exists(DELTA_MODEL_PATH):
     try:
         D_adv = load_delta_base(DELTA_MODEL_PATH, DELTA_PATCHED_PATH)
-        st.sidebar.success(f"Delta model loaded (patched): {DELTA_PATCHED_PATH}")
+        MODEL_STATUS.append(("Perturbation estimator", DELTA_MODEL_PATH, "ok", f"Patched: {DELTA_PATCHED_PATH}"))
     except Exception as e:
-        st.sidebar.error("Delta model failed to load.")
-        st.error(f"Delta model load failed: {type(e).__name__}: {e}")
+        MODEL_STATUS.append(("Perturbation estimator", DELTA_MODEL_PATH, "off", "Could not be loaded"))
+        LOAD_ERRORS.append(("Delta model load failed", f"{type(e).__name__}: {e}"))
 else:
-    st.sidebar.warning(f"Missing: {DELTA_MODEL_PATH}")
-
+    MODEL_STATUS.append(("Perturbation estimator", DELTA_MODEL_PATH, "off", "File not found"))
 R = None
 if os.path.exists(RECONSTRUCTOR_PATH):
     try:
         R = load_reconstructor()
-        st.sidebar.success(f"Reconstructor loaded: {RECONSTRUCTOR_PATH}")
+        MODEL_STATUS.append(("Reconstructor", RECONSTRUCTOR_PATH, "ok", ""))
     except Exception as e:
-        st.sidebar.error("Reconstructor failed to load.")
-        st.error(f"Reconstructor load failed: {type(e).__name__}: {e}")
+        MODEL_STATUS.append(("Reconstructor", RECONSTRUCTOR_PATH, "off", "Could not be loaded"))
+        LOAD_ERRORS.append(("Reconstructor load failed", f"{type(e).__name__}: {e}"))
 else:
-    st.sidebar.warning(f"Missing: {RECONSTRUCTOR_PATH}")
-
+    MODEL_STATUS.append(("Reconstructor", RECONSTRUCTOR_PATH, "off", "File not found"))
 attack_type_clf = None
 if os.path.exists(ATTACK_TYPE_PATH):
     try:
         attack_type_clf = load_attack_type_clf()
-        st.sidebar.success(f"Attack-type model loaded: {ATTACK_TYPE_PATH}")
+        MODEL_STATUS.append(("Attack-type classifier", ATTACK_TYPE_PATH, "ok", "FGSM vs PGD"))
     except Exception as e:
-        st.sidebar.error("Attack-type model failed to load.")
-        st.error(f"Attack-type load failed: {type(e).__name__}: {e}")
+        MODEL_STATUS.append(("Attack-type classifier", ATTACK_TYPE_PATH, "warn", "Could not be loaded (optional)"))
+        LOAD_ERRORS.append(("Attack-type load failed", f"{type(e).__name__}: {e}"))
 else:
-    st.sidebar.warning(f"Missing: {ATTACK_TYPE_PATH}")
-
+    MODEL_STATUS.append(("Attack-type classifier", ATTACK_TYPE_PATH, "warn", "File not found (optional)"))
 norm_clf = None
 if os.path.exists(NORM_CLASSIFIER_PATH):
     try:
         norm_clf = load_norm_clf()
-        st.sidebar.success(f"Norm classifier loaded: {NORM_CLASSIFIER_PATH}")
+        MODEL_STATUS.append(("Norm classifier", NORM_CLASSIFIER_PATH, "ok", "L∞ vs L2"))
     except Exception as e:
-        st.sidebar.error("Norm classifier failed to load.")
-        st.error(f"Norm classifier load failed: {type(e).__name__}: {e}")
+        MODEL_STATUS.append(("Norm classifier", NORM_CLASSIFIER_PATH, "off", "Could not be loaded"))
+        LOAD_ERRORS.append(("Norm classifier load failed", f"{type(e).__name__}: {e}"))
 else:
-    st.sidebar.warning(f"Missing: {NORM_CLASSIFIER_PATH}")
-
+    MODEL_STATUS.append(("Norm classifier", NORM_CLASSIFIER_PATH, "off", "File not found"))
 def ss_init(name, value):
     if name not in st.session_state:
         st.session_state[name] = value
-
 ss_init("x_clean", None)
 ss_init("img32_clean", None)
-
 ss_init("x_adv", None)
 ss_init("img32_adv", None)
 ss_init("delta", None)
@@ -291,23 +756,22 @@ ss_init("norm_probs2", None)
 ss_init("final_mode", None)
 ss_init("final_pred", None)
 ss_init("final_top3", None)
-
+ss_init("upload_digest", None)
+ss_init("attack_detected", None)
+ss_init("attack_probability", None)
+ss_init("attack_type_probs", None)
 def compute_attack_type_from_delta(delta: np.ndarray):
     if attack_type_clf is None:
         return None
-
     inp = np.expand_dims(delta.astype(np.float32), axis=0)
-
     try:
         expected = attack_type_clf.inputs[0].shape
         if len(expected) == 4 and expected[-1] == 1 and inp.shape[-1] == 3:
             inp = np.mean(inp, axis=-1, keepdims=True).astype(np.float32)
     except Exception:
         pass
-
     logits = attack_type_clf.predict(inp, verbose=0)[0]
     logits = np.array(logits).reshape(-1)
-
     if logits.shape[0] == 2:
         probs = tf.nn.softmax(logits).numpy()
     elif logits.shape[0] == 1:
@@ -315,11 +779,9 @@ def compute_attack_type_from_delta(delta: np.ndarray):
         probs = np.array([1.0 - p_pgd, p_pgd], dtype=np.float32)
     else:
         probs = logits
-
     pred_idx = int(np.argmax(probs))
     pred_label = ATTACK_LABELS[pred_idx] if pred_idx < len(ATTACK_LABELS) else f"class_{pred_idx}"
     return pred_label, probs
-
 def compute_norm_from_attacked(x_adv: np.ndarray):
     """
     Returns:
@@ -327,10 +789,8 @@ def compute_norm_from_attacked(x_adv: np.ndarray):
     """
     if norm_clf is None:
         return None, None
-
     nlogits = norm_clf.predict(x_adv.astype(np.float32), verbose=0)[0]
     nlogits = np.array(nlogits).reshape(-1)
-
     norm_probs2 = None
     if nlogits.shape[0] == 3:
         p3 = tf.nn.softmax(nlogits).numpy()
@@ -343,435 +803,762 @@ def compute_norm_from_attacked(x_adv: np.ndarray):
     elif nlogits.shape[0] == 1:
         p_l2 = float(nlogits[0])
         norm_probs2 = np.array([1.0 - p_l2, p_l2], dtype=np.float32)
-
     if norm_probs2 is None:
         return None, None
-
     norm_label = "L2" if int(np.argmax(norm_probs2)) == 1 else "Linf"
     return norm_label, norm_probs2
-
 def compute_reconstruction(x_adv: np.ndarray, delta: np.ndarray):
     if R is None:
         return None
     delta_b = np.expand_dims(delta.astype(np.float32), axis=0)
     x_rec = R.predict([x_adv.astype(np.float32), delta_b], verbose=0)[0]
     return np.clip(x_rec, 0.0, 1.0).astype(np.float32)
-
 def compute_mix_if_needed(x_adv: np.ndarray, x_rec: np.ndarray, norm_label: str, mix_alpha: float):
     """
     Only mix if norm_label == "L2" (per your requirement).
     """
-    if norm_label != "L2":
+    if norm_label == "Linf":
         return None, x_rec, "NOT MIXED (norm=Linf → final is reconstructed)"
+    if norm_label != "L2":
+        raise ValueError(f"Unknown attack norm: {norm_label!r}")
     a = float(mix_alpha)
     x_mix = np.clip(a * x_adv[0] + (1.0 - a) * x_rec, 0.0, 1.0).astype(np.float32)
     return x_mix, x_mix, f"MIXED (norm=L2 → final is x_mix = {a:.2f}*x_adv + {1-a:.2f}*x_rec)"
-
 FORCED_IDX = 0
-
 def classify_with_base(x_img32: np.ndarray):
     if clf is None:
         return None, None, None
-
-    x = np.expand_dims(x_img32, axis=0).astype(np.float32)
-
-    preds = clf.predict(x, verbose=0)[0]
-    probs = preds / np.sum(preds)
-
+    x = np.expand_dims(
+        x_img32, axis=0
+    ).astype(np.float32)
+    # Get raw logits from EfficientNetV2
+    logits = clf.predict(x, verbose=0)[0]
+    # CORRECT: Convert logits into probabilities
+    probs = tf.nn.softmax(logits).numpy()
+    # Sort probabilities from highest to lowest
     top_indices = np.argsort(probs)[::-1][:3]
-
-    pred = (cifar10_class_names[top_indices[0]], float(probs[top_indices[0]]))
-    top3 = [(cifar10_class_names[i], float(probs[i])) for i in top_indices]
-
+    pred = (
+        cifar10_class_names[top_indices[0]],
+        float(probs[top_indices[0]])
+    )
+    top3 = [
+        (cifar10_class_names[i], float(probs[i]))
+        for i in top_indices
+    ]
     return pred, top3, probs
+def detect_attack(x_batch: np.ndarray):
+    """Return binary decision and P(attacked). Never silently assume clean."""
+    if binary_detector is None:
+        raise RuntimeError("Binary detector is not available: cannot decide clean vs attacked")
+    raw = np.asarray(binary_detector.predict(x_batch.astype(np.float32), verbose=0))
+    if raw.size != 1:
+        raise ValueError(f"Expected a single sigmoid detector score; received shape {raw.shape}")
+    p = float(raw.reshape(-1)[0])
+    if not np.isfinite(p) or not (0.0 <= p <= 1.0):
+        raise ValueError(f"Invalid P(attacked) from detector: {p}")
+    return p >= binary_threshold, p
 
 
+def reset_uploaded_image_state():
+    """Remove ALL results for the previously uploaded image."""
+    for key in (
+        "x_adv", "img32_adv", "delta", "delta_hm", "x_rec",
+        "x_mix", "x_final", "attack_type", "attack_type_probs",
+        "norm_label", "norm_probs2", "final_mode", "final_pred",
+        "final_top3", "attack_detected", "attack_probability",
+    ):
+        st.session_state[key] = None
 
 
+def update_final_from_reconstruction(alpha: float):
+    """Recompute mix and final prediction when the slider changes."""
+    ss = st.session_state
+    if ss.x_adv is None or ss.x_rec is None:
+        raise RuntimeError("Attacked input/reconstruction not ready")
+    if ss.norm_label not in ("Linf", "L2"):
+        raise RuntimeError("Norm classification missing; cannot select final image")
+    if clf is None:
+        raise RuntimeError("Base classifier not loaded")
+    x_mix, x_final, mode = compute_mix_if_needed(
+        ss.x_adv, ss.x_rec, ss.norm_label, alpha
+    )
+    pred, top3, _ = classify_with_base(x_final)
+    ss.x_mix = x_mix
+    ss.x_final = x_final
+    ss.final_mode = mode
+    ss.final_pred = pred
+    ss.final_top3 = top3
 
-mix_alpha = st.sidebar.slider(
-    "Mix alpha (only used if norm == L2)",
-    0.0, 1.0, 0.5, 0.05
-)
-st.sidebar.caption("If the norm is predicted as **L2**, the app will create **x_mix** and use it for the final prediction.")
 
+# =============================================================================
+# Navigation + sidebar
+# =============================================================================
+PAGES = {
+    "overview": "Overview",
+    "baseline": "Clean baseline",
+    "scan": "Scan and defend",
+    "profile": "Attack profile",
+    "purify": "Purification",
+    "verdict": "Verdict and report",
+}
+ss_init("nav", "overview")
+
+
+def go_to(page_key):
+    st.session_state.nav = page_key
+
+
+def ensure_attacked_for_pages():
+    """Pages 3-5 are for confirmed attacks only."""
+    if st.session_state.attack_detected is False:
+        outcome("good", "<b>No attack detected on the last scan.</b> The detector judged the image clean, so no "
+                        "perturbation estimate, heatmap, or defense was run. Upload a different image in "
+                        "<b>Scan and defend</b> to test again.")
+        st.button("Go to Scan and defend", on_click=go_to, args=("scan",), type="primary", key="ensure_clean_go")
+        st.stop()
+    if st.session_state.attack_detected is not True:
+        empty_state("Nothing scanned yet",
+                    "Upload an image in <b>Scan and defend</b> first. The attack detector always runs before any defense step.")
+        st.button("Go to Scan and defend", on_click=go_to, args=("scan",), type="primary", key="ensure_none_go")
+        st.stop()
+
+
+def nav_footer(prev_key=None, next_key=None, next_label=None):
+    html('<div style="height:.6rem"></div>')
+    c1, _, c3 = st.columns([1, 2, 1])
+    with c1:
+        if prev_key:
+            st.button(f"Back: {PAGES[prev_key]}", on_click=go_to, args=(prev_key,), key=f"prev_{prev_key}")
+    with c3:
+        if next_key:
+            html('<span class="cv-right"></span>')
+            st.button(next_label or f"Next: {PAGES[next_key]}", on_click=go_to, args=(next_key,),
+                      type="primary", key=f"next_{next_key}")
+
+
+with st.sidebar:
+    html(f'''<div class="cv-brand">{logo_svg(48, fg="#E6EEFA", accent="#7FAEFF", bg="#0C2346", circuits=False)}
+         <div><div class="cv-wordmark">ClearVision</div><div class="cv-tagline">Predict, Purify, Protect</div></div></div>''')
 
 page = st.sidebar.radio(
-    "Pages",
-    [
-        "0) Clean (Defenseless) Baseline",
-        "1) Upload & Attack Detection",
-        "2) Norm Classification (L∞ vs L2)",
-        "3) Defense Outputs (Reconstruct + Mix)",
-        "4) Final Classification (Summary + Downloads)"
-    ]
+    "Navigate",
+    list(PAGES.keys()),
+    format_func=lambda k: PAGES[k],
+    key="nav",
+    label_visibility="collapsed",
 )
+st.sidebar.markdown('<div class="cv-side-label">Defense setting</div>', unsafe_allow_html=True)
+mix_alpha = st.sidebar.slider(
+    "L2 blend strength (α)",
+    0.0, 1.0, 0.5, 0.05,
+)
+st.sidebar.caption("Applies only when the attack norm is predicted as L2. The blended image is then used for the final prediction.")
+
+with st.sidebar:
+    n_ok = sum(1 for _, _, s, _ in MODEL_STATUS if s == "ok")
+    any_off = any(s == "off" for _, _, s, _ in MODEL_STATUS)
+    led = "off" if any_off else ("warn" if n_ok < len(MODEL_STATUS) else "")
+    html(f'<div class="cv-side-label">System status</div>'
+         f'<div class="cv-status-sum"><span class="cv-led {led}"></span>{n_ok} of {len(MODEL_STATUS)} models ready</div>')
+    with st.expander("Model details"):
+        items = "".join(
+            f'<li><span class="cv-led {"" if s == "ok" else s}"></span><div>{esc(name)}<small>{esc(fn)}{(" | " + esc(note)) if note else ""}</small></div></li>'
+            for name, fn, s, note in MODEL_STATUS
+        )
+        html(f'<ul class="cv-status">{items}</ul>')
+        if detector_meta_note:
+            st.caption(detector_meta_note)
+    with st.expander("Diagnostics"):
+        st.caption("Binary detection runs before the defense. Delta is NOT rescaled by eps.")
+        st.caption("Files in current directory")
+        st.write(os.listdir("."))
+
+for title, detail in LOAD_ERRORS:
+    outcome("bad", f"<b>{esc(title)}.</b> <span style='font-family:monospace;font-size:.88rem'>{esc(detail)}</span>")
 
 
-if page == "0) Clean (Defenseless) Baseline":
-    st.header("0) Clean (Defenseless) Baseline")
+# =============================================================================
+# Pipeline rail: shows where the current scan is in the defense pipeline
+# =============================================================================
+def rail_html(explain=False):
+    ss = st.session_state
+    det = ss.attack_detected
+    stages = []
+    if explain:
+        stages = [
+            ("", "Detect", "Is this image under attack?"),
+            ("", "Isolate", "Estimate the hidden perturbation"),
+            ("", "Profile", "Identify method (FGSM/PGD) and norm (L∞/L2)"),
+            ("", "Purify", "Reconstruct the image without the attack"),
+            ("", "Classify", "Return the corrected answer"),
+        ]
+        body = "".join(
+            f'<div class="cv-stage done"><div class="cv-dot">{i + 1}</div><b>{t}</b><span>{d}</span></div>'
+            for i, (_, t, d) in enumerate(stages)
+        )
+        return f'<div class="cv-rail">{body}</div>'
 
-    st.write(
-        "Upload a **CLEAN** image (non-attacked). This is the **defenseless baseline**.\n"
-        "It runs the **base classifier** directly on the clean input so you can compare against the attacked image later."
-    )
+    def node(state, num, title, val, sub):
+        icon = {"done": ICON_CHECK, "alert": ICON_ALERT, "clean": ICON_CHECK, "skip": ICON_SKIP}.get(state, str(num))
+        return (f'<div class="cv-stage {state}"><div class="cv-dot">{icon}</div><b>{title}</b>'
+                f'<span class="cv-val">{val}</span><span>{sub}</span></div>')
 
-    up_clean = st.file_uploader("Upload CLEAN image", type=["png", "jpg", "jpeg"], key="clean_upload_page0")
+    p = ss.attack_probability
+    if det is None:
+        n1 = node("", 1, "Detect", "Waiting for an image", "Attack detector")
+    elif det:
+        n1 = node("alert", 1, "Detect", "Attack detected", f"P(attacked) {p:.1%}")
+    else:
+        n1 = node("clean", 1, "Detect", "No attack", f"P(attacked) {p:.1%}")
+    skip = det is False
+    if skip:
+        rest = [node("skip", i, t, "Not needed", "Skipped for clean images")
+                for i, t in [(2, "Isolate"), (3, "Profile"), (4, "Purify"), (5, "Classify")]]
+        return f'<div class="cv-rail">{n1}{"".join(rest)}</div>'
+    n2 = (node("done", 2, "Isolate", "Perturbation isolated", f"mean |δ̂| {float(np.mean(np.abs(ss.delta))):.4f}")
+          if ss.delta is not None else node("", 2, "Isolate", "Pending", "Perturbation estimator"))
+    if ss.norm_label is not None:
+        method = (ss.attack_type or "unknown").upper()
+        n3 = node("done", 3, "Profile", f"{method}, {norm_display(ss.norm_label)} norm", "Method and norm identified")
+    else:
+        n3 = node("", 3, "Profile", "Pending", "Method and norm")
+    if ss.x_rec is not None:
+        n4 = node("done", 4, "Purify", "Image reconstructed",
+                  "Blended with input (L2)" if ss.x_mix is not None else "Used directly (L∞)")
+    else:
+        n4 = node("", 4, "Purify", "Pending", "Reconstructor")
+    if ss.final_pred is not None:
+        n5 = node("done", 5, "Classify", esc(ss.final_pred[0]).capitalize(), f"{ss.final_pred[1]:.1%} confidence")
+    else:
+        n5 = node("", 5, "Classify", "Pending", "Image classifier")
+    return f'<div class="cv-rail">{n1}{n2}{n3}{n4}{n5}</div>'
+
+
+def downloads_block(items, title="Downloads", sub="Save results for your report or for offline analysis."):
+    """items: list of (label, data, file_name, mime). Rendered as a grid of download buttons."""
+    items = [i for i in items if i is not None]
+    with box():
+        section(title, sub)
+        cols = st.columns(4)
+        for i, (label, data, fname, mime) in enumerate(items):
+            with cols[i % len(cols)]:
+                st.download_button(label, data=data, file_name=fname, mime=mime, key=f"dl_{fname}")
+
+
+# =============================================================================
+# Pages
+# =============================================================================
+if page == "overview":
+    html(f'''<div class="cv-hero">
+      <div>
+        <h1>Invisible noise can fool AI. ClearVision sees through it.</h1>
+        <p>Adversarial attacks add pixel changes too small for a person to notice, yet they push image
+        classifiers to confident, wrong answers. ClearVision screens every image, isolates the hidden
+        perturbation, and reconstructs a clean version so the classifier gets the right answer back.</p>
+      </div>
+      <div class="cv-mark">{logo_svg(210)}<div class="cv-wm">ClearVision</div><div class="cv-tl">Predict, Purify, Protect</div></div>
+    </div>''')
+    c1, c2, _ = st.columns([0.62, 1, 3.6], gap="small")
+    with c1:
+        st.button("Scan Image", on_click=go_to, args=("scan",), type="primary", key="hero_scan")
+    with c2:
+        st.button("Clean Baseline", on_click=go_to, args=("baseline",), key="hero_base")
+    html('<div style="height:.8rem"></div>')
+    html('''<div class="cv-pillars">
+      <div class="cv-pillar"><h3>Predict</h3>
+        <p>A trained detector decides whether an image has been tampered with. Clean images pass straight through untouched.</p>
+        <small>Attack detector, attack-type classifier, norm classifier</small></div>
+      <div class="cv-pillar"><h3>Purify</h3>
+        <p>For attacked images, a second network estimates the exact noise pattern the attacker added, and a reconstructor removes it.</p>
+        <small>Perturbation estimator (δ̂), reconstructor, norm-gated blend</small></div>
+      <div class="cv-pillar"><h3>Protect</h3>
+        <p>The purified image goes back to the original classifier, restoring the answer the attacker tried to change.</p>
+        <small>EfficientNetV2 CIFAR-10 classifier</small></div>
+    </div>''')
+    section("The defense pipeline", "Every scan moves through these five stages. The same tracker appears on each results page so you always know where you are.")
+    html(rail_html(explain=True))
+    col_a, col_b = st.columns([1.05, 1], gap="large")
+    with col_a:
+        section("How to run the demo")
+        html('''<ol class="cv-steps">
+          <li><b>Clean baseline.</b> Upload the original, unaltered image to record what the classifier normally says.</li>
+          <li><b>Scan and defend.</b> Upload the attacked version. The detector flags it and the full defense runs automatically.</li>
+          <li><b>Attack profile.</b> See which attack method and norm were identified, and why that changes the defense.</li>
+          <li><b>Purification.</b> Compare the attacked input, the isolated noise, and the reconstructed image side by side.</li>
+          <li><b>Verdict and report.</b> Review the final answer and download every intermediate result.</li>
+        </ol>''')
+    with col_b:
+        section("Why it matters")
+        html('''<div class="cv-card"><h4>Vision systems make real decisions</h4>
+          <p>Image classifiers sit inside vehicles, medical imaging tools, and security and defense systems.
+          A single manipulated image can change what those systems see, without any visible sign of tampering.</p></div>
+          <div class="cv-card"><h4>Defense without retraining</h4>
+          <p>ClearVision runs in front of an existing classifier. It removes the attack from the image rather than
+          requiring the protected model to be rebuilt.</p></div>''')
+    st.caption("Models expect 32×32 RGB images (CIFAR-10). Larger uploads are resized to 32×32 automatically.")
+
+
+elif page == "baseline":
+    page_header(1, "Clean baseline",
+                "Upload an unaltered image to see what the classifier predicts with no attack and no defense. "
+                "This becomes the reference answer that the defended result is compared against.")
+    left, right = st.columns([1, 1.15], gap="large")
+    with left:
+        up_clean = st.file_uploader("Clean image (PNG or JPG)", type=["png", "jpg", "jpeg"], key="clean_upload_page0")
     if up_clean:
         img_bgr = decode_image(up_clean)
         if img_bgr is None:
-            st.error("Could not decode image.")
+            outcome("bad", "<b>This file could not be read as an image.</b> Upload a PNG or JPG file.")
             st.stop()
-
-        st.image(img_bgr, caption="Uploaded clean image (BGR)", channels="BGR")
-
         x_clean, img32_clean = to_cifar(img_bgr)
+        with left:
+            html(strip([
+                tile(img_bgr, "Uploaded image", f"{img_bgr.shape[1]}×{img_bgr.shape[0]} pixels", kind="bgr"),
+                tile(img32_clean, "Model input", "Resized to 32×32 RGB"),
+            ], arrows=True))
         st.session_state.x_clean = x_clean
         st.session_state.img32_clean = img32_clean
-
-        st.subheader("Base classifier on clean image (x_clean)")
-        if clf is None:
-            st.info("Base classifier not available.")
-        else:
-            pred_clean, top3_clean, _ = classify_with_base(img32_clean)
-            if pred_clean is None:
-                st.warning("Base classifier prediction failed.")
+        with right:
+            if clf is None:
+                outcome("warn", "<b>Image classifier not available.</b> Check that the classifier file is in the working directory.")
             else:
-                st.write(f"**Prediction on clean:** {pred_clean[0]} ({pred_clean[1]:.2f})")
-                st.write("**Top 3:**")
-                for label, p in top3_clean:
-                    st.write(f"- {label}: {p:.2f}")
-
-        st.subheader("Download")
-        st.download_button(
-            "Download clean 32×32 image (PNG)",
-            data=png_bytes_from_float01(img32_clean),
-            file_name="clean_32x32.png",
-            mime="image/png"
-        )
-
-
-elif page == "1) Upload & Attack Detection":
-    st.header("1) Upload & Attack Detection")
-    st.write(
-        "Upload the **ATTACKED** image once. The app will automatically:\n"
-        "- Convert to 32×32 CIFAR-10 format\n"
-        "- Predict **δ̂** (attack delta)\n"
-        "- Show a heatmap of |δ̂|\n"
-        "- Predict **attack type** (FGSM vs PGD) from δ̂\n"
-        "- Run the **base classifier** on the attacked image (x_adv)\n"
-        "\nIf you uploaded a clean image on Page 0, you can compare the baseline vs attacked predictions."
-    )
-
-    if D_adv is None:
-        st.warning("Delta isolator model not loaded. Put the file next to app.py and refresh.")
-        st.stop()
-
-    up_adv = st.file_uploader("Upload ATTACKED image", type=["png", "jpg", "jpeg"], key="adv_upload_page1")
-    if up_adv:
-        img_bgr = decode_image(up_adv)
-        if img_bgr is None:
-            st.error("Could not decode image.")
-            st.stop()
-
-        st.image(img_bgr, caption="Uploaded attacked image (BGR)", channels="BGR")
-
-        x_adv, img32 = to_cifar(img_bgr)
-        delta = D_adv.predict(x_adv, verbose=0)[0]
-        hm, d_mean, d_max = delta_heatmap(delta)
-
-        st.session_state.x_adv = x_adv
-        st.session_state.img32_adv = img32
-        st.session_state.delta = delta
-        st.session_state.delta_hm = hm
-
-        at = compute_attack_type_from_delta(delta)
-        if at is not None:
-            pred_label, probs = at
-            st.session_state.attack_type = pred_label
-        else:
-            st.session_state.attack_type = None
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.image(img32, caption="Attacked (32×32 RGB)", channels="RGB")
-        with c2:
-            st.image(hm, caption="|δ̂| heatmap", channels="RGB")
-
-        st.caption(
-            f"δ̂ stats: min={float(delta.min()):.4f}, max={float(delta.max()):.4f}, "
-            f"max|δ̂|={float(np.max(np.abs(delta))):.4f}, mean|δ̂|={float(np.mean(np.abs(delta))):.5f}"
-        )
-
-        st.subheader("Base classifier comparison (clean vs attacked)")
-        if clf is None:
-            st.info("Base classifier not available.")
-        else:
-            if st.session_state.img32_clean is not None:
-                pred_clean, top3_clean, _ = classify_with_base(st.session_state.img32_clean)
-                if pred_clean is not None:
-                    st.write(f"**Clean prediction:** {pred_clean[0]} ({pred_clean[1]:.2f})")
-            else:
-                st.caption("Tip: upload a clean baseline image on **Page 0** to compare.")
-
-            pred_adv, top3_adv, _ = classify_with_base(img32)
-            if pred_adv is not None:
-                st.write(f"**Attacked prediction:** {pred_adv[0]} ({pred_adv[1]:.2f})")
-
-        st.subheader("Attack Type (from δ̂)")
-        if st.session_state.attack_type is not None:
-            st.write(f"**Predicted attack:** `{st.session_state.attack_type}`")
-        else:
-            st.info("Attack-type classifier not available.")
-
-        st.subheader("Downloads")
-        hm_png = png_bytes_from_rgb(hm.astype(np.uint8))
-        if hm_png:
+                pred_clean, top3_clean, _ = classify_with_base(img32_clean)
+                if pred_clean is None:
+                    outcome("warn", "<b>Base classifier prediction failed.</b>")
+                else:
+                    html(verdict_html("Classifier answer on the clean image", pred_clean[0], pred_clean[1], tone="blue"))
+                    with box():
+                        section("Top 3 classes", "How confident the classifier is in its leading guesses.")
+                        html(bars_html(top3_clean))
+                    outcome("info", "<b>Baseline saved.</b> This answer will appear next to the defended result in "
+                                    "<b>Scan and defend</b> and <b>Verdict and report</b>.")
+            with st.expander("Technical verification (model and image fingerprints)"):
+                st.write("Model path:", os.path.abspath(CLASSIFIER_PATH))
+                if clf is not None and os.path.isfile(CLASSIFIER_PATH):
+                    with open(CLASSIFIER_PATH, "rb") as f:
+                        st.write("MODEL SHA256:", hashlib.file_digest(f, "sha256").hexdigest())
+                    st.write("IMAGE SHA256:", hashlib.sha256(x_clean.tobytes()).hexdigest())
+                    logits = clf.predict(x_clean, verbose=0)[0]
+                    probs = tf.nn.softmax(logits).numpy()
+                    st.write("Horse probability:", float(probs[7]))
+                    st.write("Predicted class:",
+                             cifar10_class_names[int(np.argmax(logits))])
+                else:
+                    st.warning("Base classifier not loaded")
             st.download_button(
-                "Download delta heatmap (PNG)",
-                data=hm_png,
-                file_name="delta_heatmap.png",
+                "Download clean 32×32 image (PNG)",
+                data=png_bytes_from_float01(img32_clean),
+                file_name="clean_32x32.png",
                 mime="image/png"
             )
-        st.download_button(
-            "Download delta array (.npy)",
-            data=npy_download(delta),
-            file_name="delta.npy",
-            mime="application/octet-stream"
-        )
+        nav_footer("overview", "scan", "Next: scan an attacked image")
+    else:
+        with right:
+            empty_state("No image yet",
+                        "Drop a clean CIFAR-10 style image on the left. Any size works; it is resized to 32×32 for the model.")
+        nav_footer("overview", "scan")
 
 
-elif page == "2) Norm Classification (L∞ vs L2)":
-    st.header("2) Norm Classification (L∞ vs L2)")
+elif page == "scan":
+    page_header(2, "Scan and defend",
+                "Upload any image, clean or attacked. The detector screens it first. If it finds an attack, the full "
+                "defense runs automatically: isolate the perturbation, profile the attack, reconstruct, and reclassify.")
+    rail_slot = st.empty()
+    html(rail_html(), rail_slot)
 
-    st.write(
-        "This step uses the **attacked image you uploaded** (not δ̂) to classify the attack norm.\n\n"
-        "**Important rule:**\n"
-        "- If norm is **L2** → we will use the **MIX defense** in the final step.\n"
-        "- If norm is **L∞** → we will **NOT** mix; we use the reconstructed image directly.\n"
-    )
-
-    if st.session_state.x_adv is None:
-        st.info("Upload an attacked image on **Page 1** first.")
+    if binary_detector is None:
+        outcome("bad", f"<b>Cannot detect attacks.</b> Place <code>{esc(BINARY_DETECTOR_PATH)}</code> next to app.py, "
+                       "then restart the website. No default clean/attacked guess is made.")
         st.stop()
 
+    left, right = st.columns([1, 1.15], gap="large")
+    with left:
+        up_adv = st.file_uploader(
+            "Image to scan (clean or attacked)",
+            type=["png", "jpg", "jpeg"], key="adv_upload_page1"
+        )
+    if up_adv is None:
+        with right:
+            if st.session_state.attack_detected is not None:
+                empty_state("Ready for the next scan",
+                            "Your last scan is still available in <b>Attack profile</b>, <b>Purification</b>, "
+                            "and <b>Verdict and report</b>. Upload a new image to replace it.")
+            else:
+                empty_state("No image yet",
+                            "Upload an attacked image (FGSM or PGD, L∞ or L2) or a clean one. "
+                            "Clean images are passed through without running the defense.")
+    if up_adv is not None:
+        img_bgr = decode_image(up_adv)
+        if img_bgr is None:
+            outcome("bad", "<b>This file could not be read as an image.</b> Upload a PNG or JPG file.")
+            st.stop()
+        x_input, img32 = to_cifar(img_bgr)
+        # Hash upload content, not just filename, so different images cannot
+        # reuse reconstruction/mix/final predictions from a previous upload.
+        signature = (hashlib.sha256(up_adv.getvalue()).hexdigest(), binary_threshold)
+        if (st.session_state.upload_digest != signature
+                or st.session_state.attack_detected is None):
+            reset_uploaded_image_state()
+            st.session_state.x_adv = x_input
+            st.session_state.img32_adv = img32
+            try:
+                is_attacked, p_attacked = detect_attack(x_input)
+            except Exception as e:
+                outcome("bad", f"<b>Binary detector prediction failed.</b> {esc(type(e).__name__)}: {esc(e)}")
+                st.stop()
+            st.session_state.attack_detected = is_attacked
+            st.session_state.attack_probability = p_attacked
+            st.session_state.upload_digest = signature
+        html(rail_html(), rail_slot)
+
+        p_attacked = st.session_state.attack_probability
+        attacked = st.session_state.attack_detected is True
+        with left:
+            html(strip([
+                tile(img_bgr, "Uploaded image", f"{img_bgr.shape[1]}×{img_bgr.shape[0]} pixels", kind="bgr"),
+                tile(img32, "Model input", "Resized to 32×32 RGB"),
+            ]))
+        with right:
+            color = "var(--cv-red)" if attacked else "var(--cv-green)"
+            chip = ('<span class="cv-chip red">Attack detected</span>' if attacked
+                    else '<span class="cv-chip green">No attack detected</span>')
+            html(f'''<div class="cv-card">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+                  <div><div class="cv-kicker">Attack detector</div>
+                  <div class="cv-big" style="color:{color}">{p_attacked:.1%}</div>
+                  <div style="color:var(--cv-muted);font-size:.92rem;margin-top:4px">probability the image was attacked</div></div>
+                  {chip}
+                </div>
+                <div class="cv-meter"><div class="f" style="width:{p_attacked * 100:.1f}%;background:{color}"></div>
+                  <div class="thr" style="left:{binary_threshold * 100:.1f}%"><i>Threshold {binary_threshold:.2f}</i></div></div>
+              </div>''')
+
+        if st.session_state.attack_detected is False:
+            with right:
+                outcome("good", "<b>Clean image. Defense skipped.</b> No perturbation estimate, heatmap, attack type, "
+                                "norm, reconstruction, or blending was computed. Use <b>Clean baseline</b> if you want "
+                                "a baseline classification of this image.")
+            st.stop()
+
+        missing = [
+            name for name, model_object in (
+                (DELTA_MODEL_PATH, D_adv),
+                (RECONSTRUCTOR_PATH, R),
+                (NORM_CLASSIFIER_PATH, norm_clf),
+                (CLASSIFIER_PATH, clf),
+            ) if model_object is None
+        ]
+        if missing:
+            outcome("bad", "<b>Attack detected, but the defense cannot finish.</b> Not loaded: "
+                    + ", ".join(f"<code>{esc(m)}</code>" for m in missing))
+            st.stop()
+        if attack_type_clf is None:
+            outcome("warn", "<b>FGSM/PGD model is missing.</b> The attack type will be unavailable; the rest of the defense still runs.")
+
+        if st.session_state.x_rec is None:
+            with st.spinner("Attack detected. Isolating the perturbation, profiling the attack, and reconstructing the image..."):
+                try:
+                    delta = np.asarray(D_adv.predict(x_input, verbose=0)[0],
+                                       dtype=np.float32)
+                    if delta.shape != (32, 32, 3) or not np.isfinite(delta).all():
+                        raise ValueError(f"Unexpected delta output: {delta.shape}")
+                    hm, _, _ = delta_heatmap(delta)
+                    attack_result = compute_attack_type_from_delta(delta)
+                    norm_label, norm_probs2 = compute_norm_from_attacked(x_input)
+                    if norm_label not in ("Linf", "L2"):
+                        raise ValueError("Norm classifier did not return Linf/L2")
+                    x_rec = compute_reconstruction(x_input, delta)
+                    if x_rec is None or x_rec.shape != (32, 32, 3):
+                        raise ValueError("Reconstruction missing or has wrong shape")
+                    # Commit successful results together, to avoid partial stale state.
+                    st.session_state.delta = delta
+                    st.session_state.delta_hm = hm
+                    st.session_state.attack_type = attack_result[0] if attack_result else None
+                    st.session_state.attack_type_probs = attack_result[1] if attack_result else None
+                    st.session_state.norm_label = norm_label
+                    st.session_state.norm_probs2 = norm_probs2
+                    st.session_state.x_rec = x_rec
+                except Exception as e:
+                    outcome("bad", f"<b>Defense pipeline failed.</b> {esc(type(e).__name__)}: {esc(e)}")
+                    st.stop()
+
+        # Always refresh x_mix / x_final when alpha changes. Expensive models
+        # do not run again for a previously analyzed image.
+        try:
+            update_final_from_reconstruction(mix_alpha)
+        except Exception as e:
+            outcome("bad", f"<b>Final classification failed.</b> {esc(type(e).__name__)}: {esc(e)}")
+            st.stop()
+        html(rail_html(), rail_slot)
+
+        ss = st.session_state
+        attacked_base_pred, _, _ = classify_with_base(ss.img32_adv)
+        clean_base_pred = None
+        if ss.img32_clean is not None:
+            clean_base_pred, _, _ = classify_with_base(ss.img32_clean)
+
+        html('<div style="height:.6rem"></div>')
+        section("Before and after", "The same classifier, with and without ClearVision in front of it.")
+        html(f'''<div class="cv-ba">
+          <div class="cv-ba-side bad"><img src="{data_uri(ss.img32_adv)}" alt="Attacked input">
+            <div><div class="k">Without ClearVision</div><div class="l">{esc(attacked_base_pred[0])}</div>
+            <div class="c cv-num">{attacked_base_pred[1]:.1%} confidence on the attacked input</div></div></div>
+          <div class="cv-ba-side good"><img src="{data_uri(ss.x_final)}" alt="Defended image">
+            <div><div class="k">With ClearVision</div><div class="l">{esc(ss.final_pred[0])}</div>
+            <div class="c cv-num">{ss.final_pred[1]:.1%} confidence on the purified image</div></div></div>
+        </div>''')
+        if clean_base_pred is not None:
+            if clean_base_pred[0] == ss.final_pred[0]:
+                outcome("good", f"<b>Original answer restored.</b> The clean baseline is <b>{esc(clean_base_pred[0])}</b> "
+                                f"({clean_base_pred[1]:.1%}), and the defended image is classified as "
+                                f"<b>{esc(ss.final_pred[0])}</b> again.")
+            else:
+                outcome("warn", f"<b>Defended answer differs from the clean baseline.</b> Clean baseline: "
+                                f"<b>{esc(clean_base_pred[0])}</b> ({clean_base_pred[1]:.1%}). Defended: "
+                                f"<b>{esc(ss.final_pred[0])}</b> ({ss.final_pred[1]:.1%}).")
+        else:
+            outcome("info", "<b>Tip:</b> upload the original image in <b>Clean baseline</b> to confirm that the defended "
+                            "answer matches the unattacked one.")
+
+        col_a, col_b = st.columns([1, 1], gap="large")
+        with col_a:
+            with box():
+                section("Attack profile")
+                html(f'''<table class="cv-kv">
+                  <tr><td>Attack method</td><td>{esc((ss.attack_type or "Unavailable").upper())}</td></tr>
+                  <tr><td>Perturbation norm</td><td>{esc(norm_display(ss.norm_label))}</td></tr>
+                  <tr><td>Defense applied</td><td>{esc(friendly_mode(ss.norm_label, mix_alpha))}</td></tr>
+                  <tr><td>Pipeline mode</td><td><code>{esc(ss.final_mode)}</code></td></tr>
+                </table>''')
+        with col_b:
+            with box():
+                section("Top 3 final classes", "Classifier confidence on the purified image.")
+                html(bars_html(ss.final_top3, tone="green"))
+
+        section("What the defense did", "Left to right: the input, the perturbation ClearVision isolated, and the reconstructed image.")
+        tiles = [
+            tile(ss.img32_adv, "Uploaded input", "32×32, as the attacker sent it", tone="red"),
+            tile(ss.delta_hm, "Isolated perturbation", "Heatmap of |δ̂|, brighter is stronger", kind="uint8"),
+            tile(ss.x_rec, "Reconstruction", "Attack removed",
+                 tone="green" if ss.x_mix is None else "", tag="Sent to classifier" if ss.x_mix is None else ""),
+        ]
+        if ss.x_mix is not None:
+            tiles.append(tile(ss.x_mix, "L2 blend", f"α = {mix_alpha:.2f} input + {1 - mix_alpha:.2f} reconstruction",
+                              tone="green", tag="Sent to classifier"))
+        html(strip(tiles))
+        st.caption(
+            f"Delta statistics: min={ss.delta.min():.4f}, max={ss.delta.max():.4f}, "
+            f"mean|delta|={np.mean(np.abs(ss.delta)):.5f}, "
+            f"max|delta|={np.max(np.abs(ss.delta)):.4f}"
+        )
+        if ss.img32_clean is not None:
+            st.caption(f"Base classifier on unprotected attacked input: {attacked_base_pred[0]} ({attacked_base_pred[1]:.2%}). "
+                       f"Page 0 clean baseline: {clean_base_pred[0]} ({clean_base_pred[1]:.2%}).")
+        downloads_block([
+            ("Delta heatmap (PNG)", png_bytes_from_rgb(ss.delta_hm.astype(np.uint8)), "delta_heatmap.png", "image/png"),
+            ("Delta array (.npy)", npy_download(ss.delta), "delta.npy", "application/octet-stream"),
+            ("Reconstructed image (PNG)", png_bytes_from_float01(ss.x_rec), "reconstructed.png", "image/png"),
+            ("Final image (PNG)", png_bytes_from_float01(ss.x_final), "final_used_for_classification.png", "image/png"),
+        ])
+        nav_footer("baseline", "profile")
+
+
+elif page == "profile":
+    page_header(3, "Attack profile",
+                "ClearVision identifies how the image was attacked. The norm decides how the purified image is "
+                "prepared for the classifier, so this step changes the defense itself.")
+    ensure_attacked_for_pages()
+    if st.session_state.x_adv is None:
+        empty_state("Nothing scanned yet", "Upload an attacked image in <b>Scan and defend</b> first.")
+        st.stop()
+    rail_slot = st.empty()
     x_adv = st.session_state.x_adv
     norm_label, norm_probs2 = compute_norm_from_attacked(x_adv)
-
     st.session_state.norm_label = norm_label
     st.session_state.norm_probs2 = norm_probs2
-
+    html(rail_html(), rail_slot)
     if norm_label is None or norm_probs2 is None:
-        st.warning("Norm classifier not available or output could not be interpreted.")
+        outcome("warn", "<b>Norm classifier not available, or its output could not be interpreted.</b>")
         st.stop()
 
-    st.subheader("Result")
-    st.write(f"**Predicted norm:** `{norm_label}` (forced to only `Linf` or `L2`)")
-    st.write(f"- Linf: {float(norm_probs2[0]):.3f}")
-    st.write(f"- L2  : {float(norm_probs2[1]):.3f}")
+    col_a, col_b = st.columns([1, 1], gap="large")
+    with col_a:
+        with box():
+            html(f'<div class="cv-kicker">Perturbation norm (from the attacked image, not δ̂)</div>'
+                 f'<div class="cv-big" style="color:var(--cv-blue);margin-bottom:.9rem">{esc(norm_display(norm_label))}</div>')
+            rows = sorted([("L∞ (Linf)", float(norm_probs2[0])), ("L2", float(norm_probs2[1]))], key=lambda r: -r[1])
+            html(bars_html(rows))
+            html('''<table class="cv-kv" style="margin-top:1rem">
+              <tr><td>L∞ attack</td><td style="font-weight:500">Every pixel is nudged by a tiny, capped amount. Spread evenly across the whole image.</td></tr>
+              <tr><td>L2 attack</td><td style="font-weight:500">The total size of the change is capped. Changes can be concentrated in fewer pixels.</td></tr>
+            </table>''')
+    with col_b:
+        with box():
+            ap = st.session_state.attack_type_probs
+            at = st.session_state.attack_type
+            html(f'<div class="cv-kicker">Attack method (from δ̂)</div>'
+                 f'<div class="cv-big" style="color:var(--cv-blue);margin-bottom:.9rem">{esc((at or "Unavailable").upper())}</div>')
+            if ap is not None and len(np.asarray(ap).reshape(-1)) == len(ATTACK_LABELS):
+                apv = np.asarray(ap, dtype=np.float32).reshape(-1)
+                rows = sorted([(ATTACK_LABELS[i].upper(), float(apv[i])) for i in range(len(ATTACK_LABELS))], key=lambda r: -r[1])
+                html(bars_html(rows))
+            else:
+                st.caption("Attack-type probabilities are unavailable for this scan.")
+            html('''<table class="cv-kv" style="margin-top:1rem">
+              <tr><td>FGSM</td><td style="font-weight:500">Fast Gradient Sign Method. One large step in the direction that most confuses the model.</td></tr>
+              <tr><td>PGD</td><td style="font-weight:500">Projected Gradient Descent. Many small, refined steps; a stronger attack.</td></tr>
+            </table>''')
 
     if norm_label == "L2":
-        st.success("Norm is L2 → the app will create a MIXED image later and use it for final classification.")
+        outcome("info", f"<b>Norm is L2, so the defense will blend.</b> The final image is "
+                        f"α × input + (1 − α) × reconstruction, with α = {mix_alpha:.2f} (set in the sidebar).")
     else:
-        st.info("Norm is Linf → the app will NOT mix; final classification will use the reconstructed image.")
+        outcome("info", "<b>Norm is L∞, so the defense will not blend.</b> The reconstructed image is sent to the classifier directly.")
+    st.caption(f"Predicted norm: {norm_label} (forced to only Linf or L2). Linf: {float(norm_probs2[0]):.3f}, L2: {float(norm_probs2[1]):.3f}")
+    nav_footer("scan", "purify")
 
 
-elif page == "3) Defense Outputs (Reconstruct + Mix)":
-    st.header("3) Defense Outputs")
-
-    st.write(
-        "This page builds the defense outputs automatically:\n"
-        "- **Reconstructed image (R)** from attacked image + predicted δ̂\n"
-        "- **Mixed image (x_mix)** only if predicted norm is **L2**\n\n"
-        "**Mix rule (only for L2):** `x_mix = alpha*x_adv + (1-alpha)*x_rec`"
-    )
-
+elif page == "purify":
+    page_header(4, "Purification",
+                "ClearVision reconstructs the image from the attacked input and the perturbation it isolated. "
+                "For L2 attacks, the reconstruction is blended with the input before classification.")
+    ensure_attacked_for_pages()
     if st.session_state.x_adv is None or st.session_state.delta is None:
-        st.info("Upload an attacked image on **Page 1** first.")
+        empty_state("Nothing scanned yet", "Upload an attacked image in <b>Scan and defend</b> first.")
         st.stop()
     if R is None:
-        st.warning("Reconstructor not loaded.")
+        outcome("warn", "<b>Reconstructor not loaded.</b>")
         st.stop()
-
+    rail_slot = st.empty()
     x_adv = st.session_state.x_adv
     delta = st.session_state.delta
-
-    x_rec = compute_reconstruction(x_adv, delta)
+    x_rec = st.session_state.x_rec
     if x_rec is None:
-        st.error("Could not compute reconstruction.")
-        st.stop()
-    st.session_state.x_rec = x_rec
-
+        x_rec = compute_reconstruction(x_adv, delta)
+        if x_rec is None:
+            outcome("bad", "<b>Could not compute reconstruction.</b>")
+            st.stop()
+        st.session_state.x_rec = x_rec
     if st.session_state.norm_label is None or st.session_state.norm_probs2 is None:
         nl, np2 = compute_norm_from_attacked(x_adv)
         st.session_state.norm_label = nl
         st.session_state.norm_probs2 = np2
-
     norm_label = st.session_state.norm_label
     if norm_label is None:
-        st.warning("Norm label unavailable; cannot decide whether to mix.")
+        outcome("warn", "<b>Norm label unavailable; cannot decide whether to blend.</b>")
         st.stop()
-
     x_mix, x_final, final_mode = compute_mix_if_needed(x_adv, x_rec, norm_label, mix_alpha)
     st.session_state.x_mix = x_mix
     st.session_state.x_final = x_final
     st.session_state.final_mode = final_mode
+    html(rail_html(), rail_slot)
 
-    cols = st.columns(3 if x_mix is None else 4)
-    with cols[0]:
-        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
-    with cols[1]:
-        st.image(st.session_state.delta_hm, caption="|δ̂| heatmap", channels="RGB")
-    with cols[2]:
-        st.image(x_rec, caption="Reconstructed (x_rec)", channels="RGB")
+    tiles = [
+        tile(st.session_state.img32_adv, "Attacked input", "x_adv, 32×32", tone="red"),
+        tile(st.session_state.delta_hm, "Isolated perturbation", "|δ̂| heatmap", kind="uint8"),
+        tile(x_rec, "Reconstructed", "x_rec", tone="green" if x_mix is None else "",
+             tag="Sent to classifier" if x_mix is None else ""),
+    ]
     if x_mix is not None:
-        with cols[3]:
-            st.image(x_mix, caption="Mixed (x_mix) — ONLY for L2", channels="RGB")
+        tiles.append(tile(x_mix, "L2 blend", "x_mix, only for L2 attacks", tone="green", tag="Sent to classifier"))
+    html(strip(tiles))
 
-    st.subheader("What will be used next?")
-    st.write(f"**Final input selection:** {final_mode}")
-
-    st.subheader("Downloads")
-    st.download_button(
-        "Download reconstructed image (PNG)",
-        data=png_bytes_from_float01(x_rec),
-        file_name="reconstructed.png",
-        mime="image/png"
-    )
-    st.download_button(
-        "Download reconstructed array (.npy)",
-        data=npy_download(x_rec),
-        file_name="reconstructed.npy",
-        mime="application/octet-stream"
-    )
-
+    with box():
+        section("Image sent to the classifier")
+        html(f'''<table class="cv-kv">
+          <tr><td>Predicted norm</td><td>{esc(norm_display(norm_label))}</td></tr>
+          <tr><td>Defense applied</td><td>{esc(friendly_mode(norm_label, mix_alpha))}</td></tr>
+          <tr><td>Blend rule (L2 only)</td><td><code>x_mix = alpha*x_adv + (1-alpha)*x_rec</code></td></tr>
+          <tr><td>Final input selection</td><td><code>{esc(final_mode)}</code></td></tr>
+        </table>''')
+    dl = [
+        ("Reconstructed image (PNG)", png_bytes_from_float01(x_rec), "reconstructed.png", "image/png"),
+        ("Reconstructed array (.npy)", npy_download(x_rec), "reconstructed.npy", "application/octet-stream"),
+    ]
     if x_mix is not None:
-        st.download_button(
-            "Download mixed image (PNG)",
-            data=png_bytes_from_float01(x_mix),
-            file_name="mixed.png",
-            mime="image/png"
-        )
-        st.download_button(
-            "Download mixed array (.npy)",
-            data=npy_download(x_mix),
-            file_name="mixed.npy",
-            mime="application/octet-stream"
-        )
+        dl += [
+            ("Blended image (PNG)", png_bytes_from_float01(x_mix), "mixed.png", "image/png"),
+            ("Blended array (.npy)", npy_download(x_mix), "mixed.npy", "application/octet-stream"),
+        ]
+    downloads_block(dl)
+    nav_footer("profile", "verdict")
 
 
-elif page == "4) Final Classification (Summary + Downloads)":
-    st.header("4) Final Classification")
-
-    st.write(
-        "This page shows the **final** classification result and a clean summary of what happened.\n\n"
-        "**Decision logic:**\n"
-        "- If norm is **L2** → final image is **MIXED** (`x_mix`) and is classified.\n"
-        "- If norm is **L∞** → final image is **NOT MIXED** (use `x_rec`) and is classified.\n\n"
-    )
-
+elif page == "verdict":
+    page_header(5, "Verdict and report",
+                "The final classification of the purified image, with every intermediate result available for review and download.")
+    ensure_attacked_for_pages()
     if st.session_state.x_adv is None or st.session_state.delta is None:
-        st.info("Upload an attacked image on **Page 1** first.")
+        empty_state("Nothing scanned yet", "Upload an attacked image in <b>Scan and defend</b> first.")
         st.stop()
-
-    if st.session_state.x_rec is None or st.session_state.x_final is None:
-        if R is None:
-            st.warning("Reconstructor not loaded; cannot compute final defense output.")
-            st.stop()
-
-        x_adv = st.session_state.x_adv
-        delta = st.session_state.delta
-        x_rec = compute_reconstruction(x_adv, delta)
-        st.session_state.x_rec = x_rec
-
-        if st.session_state.norm_label is None:
-            nl, np2 = compute_norm_from_attacked(x_adv)
-            st.session_state.norm_label = nl
-            st.session_state.norm_probs2 = np2
-
-        norm_label = st.session_state.norm_label
-        x_mix, x_final, final_mode = compute_mix_if_needed(x_adv, x_rec, norm_label, mix_alpha)
-        st.session_state.x_mix = x_mix
-        st.session_state.x_final = x_final
-        st.session_state.final_mode = final_mode
-
+    if R is None:
+        outcome("warn", "<b>Reconstructor not loaded; cannot compute the final defense output.</b>")
+        st.stop()
+    if clf is None:
+        outcome("warn", "<b>Base classifier not loaded.</b>")
+        st.stop()
+    rail_slot = st.empty()
+    if st.session_state.x_rec is None:
+        st.session_state.x_rec = compute_reconstruction(
+            st.session_state.x_adv, st.session_state.delta
+        )
+    if st.session_state.norm_label is None:
+        nl, np2 = compute_norm_from_attacked(st.session_state.x_adv)
+        st.session_state.norm_label = nl
+        st.session_state.norm_probs2 = np2
+    if st.session_state.norm_label not in ("Linf", "L2"):
+        outcome("warn", "<b>Norm label unavailable; cannot select the final image.</b>")
+        st.stop()
+    update_final_from_reconstruction(mix_alpha)
     norm_label = st.session_state.norm_label
-    final_mode = st.session_state.final_mode or "Unknown"
+    final_mode = st.session_state.final_mode
+    pred, top3 = st.session_state.final_pred, st.session_state.final_top3
+    html(rail_html(), rail_slot)
 
-    if clf is not None:
-        pred, top3, _ = classify_with_base(st.session_state.x_final)
-    else:
-        pred, top3 = None, None
-    st.session_state.final_pred = pred
-    st.session_state.final_top3 = top3
+    ss = st.session_state
+    attacked_base_pred, _, _ = classify_with_base(ss.img32_adv)
+    col_a, col_b = st.columns([1, 1.1], gap="large")
+    with col_a:
+        html(verdict_html("Final answer with ClearVision", pred[0], pred[1], tone="good",
+                          note=f"Without ClearVision the classifier said {attacked_base_pred[0]} ({attacked_base_pred[1]:.1%})."))
+        with box():
+            section("Top 3 classes")
+            html(bars_html(top3, tone="green"))
+    with col_b:
+        with box():
+            section("Technical summary")
+            at = ss.attack_type
+            np2 = ss.norm_probs2
+            norm_row = (f"L∞ {float(np2[0]):.3f}, L2 {float(np2[1]):.3f}" if np2 is not None else "Unavailable")
+            p_att = ss.attack_probability
+            html(f'''<table class="cv-kv">
+              <tr><td>Detector, P(attacked)</td><td>{p_att:.1%} (threshold {binary_threshold:.2f})</td></tr>
+              <tr><td>Attack type (from δ̂)</td><td>{esc(at.upper() if at is not None else "Unavailable")}</td></tr>
+              <tr><td>Norm</td><td>{esc(norm_display(norm_label))}</td></tr>
+              <tr><td>Norm probabilities (forced L∞ vs L2)</td><td>{esc(norm_row)}</td></tr>
+              <tr><td>Final mode</td><td><code>{esc(final_mode)}</code></td></tr>
+              <tr><td>Final prediction</td><td>{esc(pred[0])} ({pred[1]:.2f})</td></tr>
+            </table>''')
 
-    st.subheader("Final result (automatic)")
-    st.write(f"**Norm:** `{norm_label}`")
-    st.write(f"**Final mode:** {final_mode}")
-    st.write(f"**Final prediction:** {pred[0]} ({pred[1]:.2f})")
+    section("Artifacts", "Every image the pipeline produced for this scan.")
+    tiles = [
+        tile(ss.img32_adv, "Attacked", "x_adv", tone="red"),
+        tile(ss.x_rec, "Reconstructed", "x_rec"),
+    ]
+    if ss.x_mix is not None:
+        tiles.append(tile(ss.x_mix, "Blended", "x_mix, only for L2"))
+    tiles.append(tile(ss.x_final, "Final input", "The image that was classified", tone="green", tag=f"Classified as {pred[0]}"))
+    html(strip(tiles))
+    st.caption("The blended image only exists (and is used) when the predicted norm is L2.")
 
-    st.write("**Top 3:**")
-    for label, p in top3:
-        st.write(f"- {label}: {p:.2f}")
-
-    st.divider()
-
-    st.subheader("Artifacts (for transparency / debugging)")
-
-    show_cols = st.columns(4 if st.session_state.x_mix is not None else 3)
-    with show_cols[0]:
-        st.image(st.session_state.img32_adv, caption="Attacked (x_adv)", channels="RGB")
-    with show_cols[1]:
-        st.image(st.session_state.x_rec, caption="Reconstructed (x_rec)", channels="RGB")
-    with show_cols[2]:
-        st.image(st.session_state.x_final, caption="Final input used (classified)", channels="RGB")
-    if st.session_state.x_mix is not None:
-        with show_cols[3]:
-            st.image(st.session_state.x_mix, caption="Mixed (x_mix) — only for L2", channels="RGB")
-
-    st.caption("Note: the mixed image only exists (and is used) when the predicted norm is L2.")
-
-    st.subheader("Downloads")
-    st.download_button(
-        "Download final image used for classification (PNG)",
-        data=png_bytes_from_float01(st.session_state.x_final),
-        file_name="final_used_for_classification.png",
-        mime="image/png"
-    )
-    st.download_button(
-        "Download final array used for classification (.npy)",
-        data=npy_download(np.asarray(st.session_state.x_final, dtype=np.float32)),
-        file_name="final_used_for_classification.npy",
-        mime="application/octet-stream"
-    )
-
-    if st.session_state.delta_hm is not None:
-        st.download_button(
-            "Download delta heatmap (PNG)",
-            data=png_bytes_from_rgb(st.session_state.delta_hm.astype(np.uint8)),
-            file_name="delta_heatmap.png",
-            mime="image/png"
-        )
-    if st.session_state.delta is not None:
-        st.download_button(
-            "Download delta array (.npy)",
-            data=npy_download(st.session_state.delta),
-            file_name="delta.npy",
-            mime="application/octet-stream"
-        )
-
-    st.subheader("Summary (automatic)")
-    if st.session_state.attack_type is not None:
-        st.write(f"- Attack type (from δ̂): `{st.session_state.attack_type}`")
-    else:
-        st.write("- Attack type (from δ̂): unavailable")
-
-    if st.session_state.norm_probs2 is not None:
-        st.write(
-            f"- Norm probs (forced Linf vs L2): Linf={float(st.session_state.norm_probs2[0]):.3f}, "
-            f"L2={float(st.session_state.norm_probs2[1]):.3f}"
-        )
-    else:
-        st.write("- Norm probs: unavailable")
-
+    dl = [
+        ("Final image (PNG)", png_bytes_from_float01(ss.x_final), "final_used_for_classification.png", "image/png"),
+        ("Final array (.npy)", npy_download(np.asarray(ss.x_final, dtype=np.float32)), "final_used_for_classification.npy", "application/octet-stream"),
+    ]
+    if ss.delta_hm is not None:
+        dl.append(("Delta heatmap (PNG)", png_bytes_from_rgb(ss.delta_hm.astype(np.uint8)), "delta_heatmap.png", "image/png"))
+    if ss.delta is not None:
+        dl.append(("Delta array (.npy)", npy_download(ss.delta), "delta.npy", "application/octet-stream"))
+    downloads_block(dl)
+    nav_footer("purify", "scan", "Scan another image")
 launch_website()
